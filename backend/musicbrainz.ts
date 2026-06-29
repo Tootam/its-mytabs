@@ -1,5 +1,3 @@
-import { normalizeLibraryText } from "./library.ts";
-
 export interface MusicBrainzLookupOptions {
     baseUrl?: string;
     fetcher?: typeof fetch;
@@ -7,6 +5,7 @@ export interface MusicBrainzLookupOptions {
     limit?: number;
     timeoutMs?: number;
     rateLimitMs?: number;
+    fallbackOnNoRecording?: boolean;
 }
 
 export interface MusicBrainzArtistCandidate {
@@ -21,6 +20,9 @@ export interface MusicBrainzReleaseCandidate {
     id: string;
     title: string;
     date: string;
+    status: string;
+    primaryType: string;
+    secondaryTypes: string[];
     score: number;
 }
 
@@ -37,28 +39,36 @@ export interface MusicBrainzLookupResult {
     recordings: MusicBrainzRecordingCandidate[];
 }
 
+let requestQueue = Promise.resolve();
+let lastRequestAt = 0;
+
 export async function lookupMusicBrainzMetadata(
     input: { artist?: string | null; title?: string | null; album?: string | null },
     options: MusicBrainzLookupOptions = {},
 ): Promise<MusicBrainzLookupResult> {
-    const artist = input.artist?.trim() ?? "";
-    const title = input.title?.trim() ?? "";
-    const album = input.album?.trim() ?? "";
+    const artist = cleanLookupText(input.artist ?? "");
+    const title = cleanLookupText(input.title ?? "");
+    const album = cleanLookupText(input.album ?? "");
     if (!artist && !title && !album) {
         return { artists: [], recordings: [] };
     }
 
     const limit = options.limit ?? 5;
     const artistResponse = artist ? await searchMusicBrainz("artist", `artist:${quoteQuery(artist)}`, limit, options) : null;
-    const rateLimitMs = options.rateLimitMs ?? (options.fetcher ? 0 : 1100);
-    if (artistResponse && title && rateLimitMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, rateLimitMs));
-    }
     const recordingResponse = title ? await searchMusicBrainz("recording", buildRecordingQuery({ artist, title, album }), limit, options) : null;
+    let recordings = recordingResponse ? mapRecordings(recordingResponse) : [];
+    if (options.fallbackOnNoRecording && title && recordings.length === 0 && album) {
+        const fallbackRecordingResponse = await searchMusicBrainz("recording", buildRecordingQuery({ artist, title }), limit, options);
+        recordings = mapRecordings(fallbackRecordingResponse);
+    }
+    if (options.fallbackOnNoRecording && title && recordings.length === 0 && artist) {
+        const fallbackRecordingResponse = await searchMusicBrainz("recording", buildRecordingQuery({ title }), limit, options);
+        recordings = mapRecordings(fallbackRecordingResponse);
+    }
 
     return {
         artists: artistResponse ? mapArtists(artistResponse) : [],
-        recordings: recordingResponse ? mapRecordings(recordingResponse) : [],
+        recordings,
     };
 }
 
@@ -85,6 +95,7 @@ async function searchMusicBrainz(entity: "artist" | "recording", query: string, 
     url.searchParams.set("fmt", "json");
     url.searchParams.set("limit", String(limit));
 
+    await waitForMusicBrainzSlot(options);
     const response = await fetcher(url, {
         signal: AbortSignal.timeout(options.timeoutMs ?? 10_000),
         headers: {
@@ -98,8 +109,33 @@ async function searchMusicBrainz(entity: "artist" | "recording", query: string, 
     return await response.json();
 }
 
+async function waitForMusicBrainzSlot(options: MusicBrainzLookupOptions): Promise<void> {
+    const rateLimitMs = options.rateLimitMs ?? (options.fetcher ? 0 : 1100);
+    if (rateLimitMs <= 0) {
+        return;
+    }
+
+    const wait = requestQueue.then(async () => {
+        const delayMs = Math.max(0, lastRequestAt + rateLimitMs - Date.now());
+        if (delayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+        lastRequestAt = Date.now();
+    });
+    requestQueue = wait.catch(() => {});
+    await wait;
+}
+
 function quoteQuery(value: string): string {
     return `"${value.replaceAll('"', '\\"')}"`;
+}
+
+function cleanLookupText(value: string): string {
+    return value
+        .trim()
+        .replaceAll("_", " ")
+        .replace(/\s+/g, " ")
+        .replace(/^[!"#$%&()*+,./:;<=>?@[\\\]^_`{|}~\s-]+|[!"#$%&()*+,./:;<=>?@[\\\]^_`{|}~\s-]+$/g, "");
 }
 
 function mapArtists(data: unknown): MusicBrainzArtistCandidate[] {
@@ -129,10 +165,14 @@ function mapRecordings(data: unknown): MusicBrainzRecordingCandidate[] {
 }
 
 function mapRelease(release: Record<string, unknown>): MusicBrainzReleaseCandidate {
+    const releaseGroup = isRecord(release["release-group"]) ? release["release-group"] : {};
     return {
         id: readString(release, "id"),
         title: readString(release, "title"),
         date: readString(release, "date"),
+        status: readString(release, "status"),
+        primaryType: readString(releaseGroup, "primary-type"),
+        secondaryTypes: Array.isArray(releaseGroup["secondary-types"]) ? releaseGroup["secondary-types"].filter((value): value is string => typeof value === "string") : [],
         score: readScore(release),
     };
 }
@@ -183,4 +223,61 @@ export function chooseBestMusicBrainzRecording(
             (expectedAlbum && candidate.releases.some((release) => normalizeLibraryText(release.title) === expectedAlbum) ? 10 : 0),
     })).sort((left, right) => right.rank - left.rank);
     return ranked[0]?.candidate ?? null;
+}
+
+export function chooseBestMusicBrainzRelease(
+    recording: MusicBrainzRecordingCandidate | null | undefined,
+    input: { album?: string | null } = {},
+): MusicBrainzReleaseCandidate | null {
+    if (!recording || recording.releases.length === 0) {
+        return null;
+    }
+
+    const expectedAlbum = normalizeLibraryText(input.album ?? "");
+    const ranked = recording.releases.map((release, index) => ({
+        release,
+        rank: release.score + releaseQualityScore(release, expectedAlbum) - (index * 0.01),
+    })).sort((left, right) => right.rank - left.rank);
+    return ranked[0]?.release ?? null;
+}
+
+function releaseQualityScore(release: MusicBrainzReleaseCandidate, expectedAlbum: string): number {
+    const title = normalizeLibraryText(release.title);
+    const secondaryTypes = release.secondaryTypes.map(normalizeLibraryText);
+    let score = 0;
+    if (expectedAlbum && title === expectedAlbum) {
+        score += 120;
+    }
+    if (normalizeLibraryText(release.status) === "official") {
+        score += 20;
+    }
+    if (normalizeLibraryText(release.primaryType) === "album") {
+        score += 30;
+    } else if (normalizeLibraryText(release.primaryType) === "single" || normalizeLibraryText(release.primaryType) === "ep") {
+        score += 8;
+    }
+    if (secondaryTypes.includes("live")) {
+        score += 5;
+    }
+    if (secondaryTypes.includes("compilation")) {
+        score -= 10;
+    }
+    if (secondaryTypes.includes("demo")) {
+        score -= 30;
+    }
+    if (secondaryTypes.includes("bootleg")) {
+        score -= 45;
+    }
+    if (/^\d{4}([-\s:]|$)/.test(title) || /^\d{4}-\d{2}-\d{2}/.test(title)) {
+        score -= 35;
+    }
+    if (/\b(demo|demos|bootleg|outtake|rehearsal|session|sessions|soundboard|audience|studio)\b/.test(title)) {
+        score -= 25;
+    }
+    score -= Math.min(25, Math.max(0, release.title.length - 32) * 0.35);
+    return score;
+}
+
+function normalizeLibraryText(value: string): string {
+    return cleanLookupText(value).toLowerCase().replace(/\s+/g, " ");
 }

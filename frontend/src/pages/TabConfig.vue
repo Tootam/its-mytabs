@@ -27,6 +27,7 @@ export default defineComponent({
             audioFiles: [],
             isLoading: true,
             isUploading: false,
+            isEnrichingMetadata: false,
             showOpenButtons: false,
         };
     },
@@ -73,6 +74,7 @@ export default defineComponent({
                     body: JSON.stringify({
                         title: this.tab.title,
                         artist: this.tab.artist,
+                        album: this.tab.album,
                         public: this.tab.public,
                     }),
                 });
@@ -87,6 +89,51 @@ export default defineComponent({
                 generalError(e);
             }
         },
+
+        async enrichInfoFromMusicBrainz() {
+            const ok = confirm("Update this song's artist, title, and album from MusicBrainz?");
+            if (!ok) {
+                return;
+            }
+
+            this.isEnrichingMetadata = true;
+            try {
+                const res = await fetch(baseURL + `/api/library-maintenance/tabs/${encodeURIComponent(this.tab.id)}/musicbrainz/enrich`, {
+                    method: "POST",
+                    credentials: "include",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        artist: this.tab.artist,
+                        title: this.tab.title,
+                        album: this.tab.album,
+                        applyBestReleaseAlbum: true,
+                    }),
+                });
+
+                await checkFetch(res);
+                const data = await res.json();
+                if (!data.applied) {
+                    notify({
+                        text: "No MusicBrainz recording match found",
+                        type: "warn",
+                    });
+                    return;
+                }
+
+                notify({
+                    text: "MusicBrainz metadata applied",
+                    type: "success",
+                });
+                await this.load();
+            } catch (e) {
+                generalError(e);
+            } finally {
+                this.isEnrichingMetadata = false;
+            }
+        },
+
         async addYoutube() {
             try {
                 // Validate URL
@@ -374,7 +421,7 @@ export default defineComponent({
             </button>
 
             <div class="mt-3">
-                Editing: {{ tab.artist }} - {{ tab.title }}
+                Editing: {{ tab.artist }} - {{ tab.title }}<span v-if="tab.album"> ({{ tab.album }})</span>
             </div>
         </div>
 
@@ -402,6 +449,12 @@ export default defineComponent({
                     <input type="text" class="form-control" id="tabArtist" v-model="tab.artist">
                 </div>
 
+                <!-- Album -->
+                <div class="mb-3">
+                    <label for="tabAlbum" class="form-label">Album</label>
+                    <input type="text" class="form-control" id="tabAlbum" v-model="tab.album">
+                </div>
+
                 <!-- Public (Dropdown) -->
                 <div class="mb-3">
                     <label for="tabPublic" class="form-label">Share to public</label>
@@ -413,6 +466,10 @@ export default defineComponent({
 
                 <!-- Save -->
                 <button type="submit" class="btn btn-primary me-2" @click.prevent="submitInfo()">Save</button>
+                <button type="button" class="btn btn-outline-secondary" :disabled="isEnrichingMetadata" @click.prevent="enrichInfoFromMusicBrainz">
+                    <span v-if="isEnrichingMetadata" class="spinner-border spinner-border-sm me-1" aria-hidden="true"></span>
+                    Fill from MusicBrainz
+                </button>
             </form>
         </div>
 
@@ -570,7 +627,8 @@ export default defineComponent({
     }
 }
 
-.youtube-item, .audio-item {
+.youtube-item,
+.audio-item {
     display: flex;
     gap: 15px;
     align-items: flex-start;

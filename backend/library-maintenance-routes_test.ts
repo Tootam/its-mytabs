@@ -144,6 +144,7 @@ Deno.test("library maintenance MusicBrainz routes use injected fetch and explici
     const app = authenticatedApp({ baseUrl: "https://example.test/ws/2", fetcher, limit: 2 });
     const artist = upsertArtist("Route MB Artist");
     const song = upsertSong(artist.id, "Route MB Song");
+    const tab = upsertLibraryTab({ id: "route-mb-tab", songId: song.id });
 
     const lookupResponse = await app.request("/api/library-maintenance/musicbrainz/lookup", {
         method: "POST",
@@ -166,6 +167,19 @@ Deno.test("library maintenance MusicBrainz routes use injected fetch and explici
     assertEquals(enrichBody.applied, true);
     assertExists(enrichBody.song.albumId);
     assertEquals(seenUrls.some((url) => url.includes("limit=3")), true);
+
+    const tabEnrichResponse = await app.request(`/api/library-maintenance/tabs/${tab.id}/musicbrainz/enrich`, {
+        method: "POST",
+        body: JSON.stringify({ artist: "Route MB Artist", title: "Route MB Song", applyBestReleaseAlbum: true }),
+        headers: { "Content-Type": "application/json" },
+    });
+    const tabEnrichBody = await tabEnrichResponse.json();
+    assertEquals(tabEnrichResponse.status, 200);
+    assertEquals(tabEnrichBody.applied, true);
+    const tabRow = db.prepare("SELECT title, artist, album FROM tabs WHERE id = ?").get(tab.id) as Record<string, unknown>;
+    assertEquals(tabRow.title, "Route MB Song");
+    assertEquals(tabRow.artist, "Route MB Artist");
+    assertEquals(tabRow.album, "Route MB Album");
 });
 
 Deno.test.afterAll(async () => {

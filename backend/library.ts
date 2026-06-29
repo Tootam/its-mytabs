@@ -720,6 +720,7 @@ function toTabInfo(tab: LibraryTab): TabInfo {
         id: tab.id,
         title: tab.title,
         artist: tab.artist,
+        album: tab.album,
         filename: tab.filename,
         originalFilename: tab.originalFilename,
         createdAt: tab.createdAt,

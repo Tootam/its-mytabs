@@ -8,6 +8,7 @@ export interface ImportJob {
     rootPath: string | null;
     copyMode: string;
     groupingMode: ImportGroupingMode;
+    musicBrainzEnabled: boolean;
     status: ImportJobStatus;
     totalCount: number;
     importedCount: number;

@@ -336,6 +336,7 @@ async function getNextID(): Promise<number> {
 export async function updateTab(tab: TabInfo, data: UpdateTabInfo) {
     tab.title = data.title;
     tab.artist = data.artist;
+    tab.album = data.album;
     tab.public = data.public;
     await writeTabInfo(tab);
 }

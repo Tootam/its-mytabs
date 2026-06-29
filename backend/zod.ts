@@ -16,6 +16,7 @@ export const TabInfoSchema = z.object({
     id: z.string().default("-1"),
     title: title.default("Unknown"),
     artist: artist.default(""),
+    album: z.string().default(""),
     filename: z.string().default("tab.gp"),
     originalFilename: z.string().default("Unknown"),
     createdAt: z.iso.datetime().default(() => new Date().toISOString()),
@@ -27,6 +28,7 @@ export type TabInfo = z.infer<typeof TabInfoSchema>;
 export const UpdateTabInfoSchema = z.object({
     title,
     artist,
+    album: z.string().trim().default(""),
     public: isPublic,
 });
 export type UpdateTabInfo = z.infer<typeof UpdateTabInfoSchema>;
@@ -119,8 +121,9 @@ export const CreateImportJobSchema = z.object({
     rootPath: z.string().min(1),
     copyMode: ImportCopyModeSchema.default("copy"),
     groupingMode: ImportGroupingModeSchema.default("auto"),
+    musicBrainzEnabled: z.boolean().default(false),
 });
-export type CreateImportJobRequest = z.infer<typeof CreateImportJobSchema>;
+export type CreateImportJobRequest = z.input<typeof CreateImportJobSchema>;
 
 const QueryStringSchema = z.string().trim().optional();
 
@@ -227,3 +230,8 @@ export const MusicBrainzEnrichSongSchema = MusicBrainzLookupSchema.extend({
     applyBestReleaseAlbum: z.boolean().default(false),
 });
 export type MusicBrainzEnrichSongRequest = z.infer<typeof MusicBrainzEnrichSongSchema>;
+
+export const MusicBrainzEnrichTabSchema = MusicBrainzLookupSchema.extend({
+    applyBestReleaseAlbum: z.boolean().default(true),
+});
+export type MusicBrainzEnrichTabRequest = z.infer<typeof MusicBrainzEnrichTabSchema>;

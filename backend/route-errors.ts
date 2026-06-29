@@ -36,6 +36,7 @@ export function routeError(c: Context, error: unknown, options: RouteErrorOption
 function isClientError(message: string): boolean {
     return [
         "Cannot ",
+        "Artist and title ",
         "Import path ",
         "Server-side import ",
         "Suggested artist ",

@@ -20,6 +20,7 @@ export default defineComponent({
             isUploading: false,
             sourcePath: "",
             groupingMode: "auto",
+            musicBrainzEnabled: false,
             importJob: null,
             importItemsPage: null,
             importReport: null,
@@ -189,6 +190,7 @@ export default defineComponent({
                 let job = await createImportJob({
                     rootPath: this.sourcePath.trim(),
                     groupingMode: this.groupingMode,
+                    musicBrainzEnabled: this.musicBrainzEnabled,
                 });
                 this.importJob = job;
                 job = await startImportScan(job.id);
@@ -528,6 +530,12 @@ export default defineComponent({
                         Scan
                     </button>
                 </div>
+                <div class="col-12">
+                    <div class="form-check">
+                        <input id="musicbrainz-enabled" v-model="musicBrainzEnabled" class="form-check-input" type="checkbox" :disabled="isStartingScan || isCommitting" />
+                        <label class="form-check-label" for="musicbrainz-enabled">Fill metadata from MusicBrainz</label>
+                    </div>
+                </div>
             </div>
 
             <div v-if="importJob" class="import-status border rounded p-3 mb-3">
@@ -546,6 +554,7 @@ export default defineComponent({
                     <span>Imported: <strong>{{ importJob.importedCount }}</strong></span>
                     <span>Skipped: <strong>{{ importJob.skippedCount }}</strong></span>
                     <span>Failed: <strong>{{ importJob.failedCount }}</strong></span>
+                    <span v-if="importJob.musicBrainzEnabled">MusicBrainz metadata</span>
                     <span v-if="importJob.errorMessage" class="text-danger">{{ importJob.errorMessage }}</span>
                 </div>
             </div>

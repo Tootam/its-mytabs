@@ -6,11 +6,12 @@ import { checkImportPathAllowed, classifyImportExtension, loadImportRootPolicy }
 import { inferMetadataFromPath, normalizeMetadata } from "./metadata.ts";
 import { getCreatedImportTabSummaries, getTabFileByHash, normalizeLibraryText, upsertAlbum, upsertArtist, upsertLibraryTab, upsertSong, upsertTabFile, upsertTabFileSource } from "./library.ts";
 import { hashReadableStream, storeLibraryFile } from "./storage.ts";
-import { BulkImportItemsRequest, CreateImportJobRequest, ImportGroupingMode, ImportItemDecision, ImportItemsQuery, ImportJobStatus, PatchImportItemRequest } from "./zod.ts";
+import { BulkImportItemsRequest, CreateImportJobRequest, CreateImportJobSchema, ImportGroupingMode, ImportItemDecision, ImportItemsQuery, ImportJobStatus, PatchImportItemRequest } from "./zod.ts";
 import { releaseReservedImportTask, reserveImportTask } from "./import-background.ts";
 import { mapItem, mapJob } from "./import-mappers.ts";
 import { buildItemFilter, itemOrderBy, normalizeItemsQuery } from "./import-query.ts";
 import { ImportItem, ImportItemsPage, ImportJob, ImportReport, ImportReviewGroup } from "./import-types.ts";
+import { chooseBestMusicBrainzRecording, chooseBestMusicBrainzRelease, lookupMusicBrainzMetadata, MusicBrainzLookupOptions, MusicBrainzLookupResult } from "./musicbrainz.ts";
 import { readNullableAggregate, readNullableNumber, readNullableString, readNumber, readString, SqlRow } from "./sql-row.ts";
 
 export type { ImportItem, ImportItemsPage, ImportJob, ImportReport, ImportReviewGroup } from "./import-types.ts";
@@ -33,9 +34,18 @@ interface ProbableDuplicate {
     existingTabId: string | null;
 }
 
+export interface ImportRuntimeOptions {
+    musicBrainz?: MusicBrainzLookupOptions;
+}
+
+interface ImportScanContext extends ImportRuntimeOptions {
+    musicBrainzCache: Map<string, Promise<MusicBrainzLookupResult>>;
+}
+
 export async function createImportJob(input: CreateImportJobRequest): Promise<ImportJob> {
+    const parsedInput = CreateImportJobSchema.parse(input);
     const policy = await loadImportRootPolicy();
-    const check = await checkImportPathAllowed(input.rootPath, policy);
+    const check = await checkImportPathAllowed(parsedInput.rootPath, policy);
     if (!check.ok) {
         throw new Error(check.message ?? "Import path is not allowed.");
     }
@@ -43,9 +53,9 @@ export async function createImportJob(input: CreateImportJobRequest): Promise<Im
     const now = new Date().toISOString();
     const id = crypto.randomUUID();
     db.prepare(`
-        INSERT INTO import_jobs (id, source_type, root_path, copy_mode, grouping_mode, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 'created', ?, ?)
-    `).run(id, input.sourceType, check.realPath ?? input.rootPath, input.copyMode, input.groupingMode, now, now);
+        INSERT INTO import_jobs (id, source_type, root_path, copy_mode, grouping_mode, musicbrainz_enabled, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'created', ?, ?)
+    `).run(id, parsedInput.sourceType, check.realPath ?? parsedInput.rootPath, parsedInput.copyMode, parsedInput.groupingMode, parsedInput.musicBrainzEnabled ? 1 : 0, now, now);
     return requireImportJob(id);
 }
 
@@ -71,17 +81,17 @@ export function reconcileInterruptedImportJobs(): number {
     return Number(result.changes);
 }
 
-export async function scanImportJob(jobId: string): Promise<ImportJob> {
+export async function scanImportJob(jobId: string, options: ImportRuntimeOptions = {}): Promise<ImportJob> {
     const scan = await prepareImportScan(jobId);
-    await runImportScan(scan.jobId, scan.rootPath);
+    await runImportScan(scan.jobId, scan.rootPath, options);
     return requireImportJob(scan.jobId);
 }
 
-export async function startImportJobScan(jobId: string): Promise<ImportJob> {
+export async function startImportJobScan(jobId: string, options: ImportRuntimeOptions = {}): Promise<ImportJob> {
     const trackTask = reserveImportTask(jobId);
     try {
         const scan = await prepareImportScan(jobId);
-        trackTask(runImportScan(scan.jobId, scan.rootPath));
+        trackTask(runImportScan(scan.jobId, scan.rootPath, options));
         return requireImportJob(scan.jobId);
     } catch (error) {
         releaseReservedImportTask(jobId);
@@ -116,18 +126,22 @@ async function prepareImportScan(jobId: string): Promise<{ jobId: string; rootPa
     return { jobId: job.id, rootPath };
 }
 
-async function runImportScan(jobId: string, rootPath: string): Promise<void> {
+async function runImportScan(jobId: string, rootPath: string, options: ImportRuntimeOptions): Promise<void> {
+    const context: ImportScanContext = {
+        ...options,
+        musicBrainzCache: new Map(),
+    };
     try {
         const stat = await Deno.stat(rootPath);
         if (stat.isFile) {
-            await scanOneFile(requireRunnableImportJob(jobId, "scanning"), rootPath, path.basename(rootPath));
+            await scanOneFile(requireRunnableImportJob(jobId, "scanning"), rootPath, path.basename(rootPath), context);
         } else if (stat.isDirectory) {
             for await (const entry of fs.walk(rootPath, { includeDirs: false, followSymlinks: false })) {
                 if (!entry.isFile) {
                     continue;
                 }
                 const relativePath = path.relative(rootPath, entry.path).split(path.SEPARATOR).join("/");
-                await scanOneFile(requireRunnableImportJob(jobId, "scanning"), entry.path, relativePath);
+                await scanOneFile(requireRunnableImportJob(jobId, "scanning"), entry.path, relativePath, context);
             }
         } else {
             throw new Error("Import path is not a file or directory.");
@@ -413,7 +427,7 @@ export function getImportReport(jobId: string): ImportReport {
     };
 }
 
-async function scanOneFile(job: ImportJob, sourcePath: string, relativePath: string): Promise<void> {
+async function scanOneFile(job: ImportJob, sourcePath: string, relativePath: string, context: ImportScanContext): Promise<void> {
     const extensionPolicy = classifyImportExtension(sourcePath);
     const now = new Date().toISOString();
     const stat = await Deno.stat(sourcePath);
@@ -430,12 +444,15 @@ async function scanOneFile(job: ImportJob, sourcePath: string, relativePath: str
 
     const hash = await hashFile(sourcePath);
     const parseResult = await parseAlphaTabFile(sourcePath);
-    const suggestion = buildSuggestion({
+    let suggestion = buildSuggestion({
         relativePath,
         groupingMode: job.groupingMode,
         parserMetadata: parseResult.ok ? parseResult.summary : undefined,
         parserError: parseResult.ok ? undefined : parseResult.error.message,
     });
+    if (job.musicBrainzEnabled) {
+        suggestion = await enrichSuggestionWithMusicBrainz(suggestion, job.groupingMode, context);
+    }
     const duplicateFile = getTabFileByHash(hash.sha256);
     const probableDuplicate = suggestion.suggestedArtist && suggestion.suggestedTitle
         ? findProbableDuplicate(suggestion.suggestedArtist, suggestion.suggestedTitle, suggestion.suggestedAlbum ?? "")
@@ -476,6 +493,73 @@ async function scanOneFile(job: ImportJob, sourcePath: string, relativePath: str
         now,
     );
     incrementJobTotal(job.id);
+}
+
+async function enrichSuggestionWithMusicBrainz(suggestion: Suggestion, groupingMode: ImportGroupingMode, context: ImportScanContext): Promise<Suggestion> {
+    if (!suggestion.suggestedTitle) {
+        return suggestion;
+    }
+
+    const cacheKey = musicBrainzCacheKey(suggestion, groupingMode);
+    let cached = context.musicBrainzCache.get(cacheKey);
+    if (!cached) {
+        cached = lookupMusicBrainzMetadata({
+            artist: suggestion.suggestedArtist,
+            title: suggestion.suggestedTitle,
+            album: suggestion.suggestedAlbum,
+        }, {
+            ...context.musicBrainz,
+            limit: context.musicBrainz?.limit ?? 5,
+        });
+        context.musicBrainzCache.set(cacheKey, cached);
+    }
+    return await applyMusicBrainzLookupToSuggestion(suggestion, groupingMode, cached);
+}
+
+function musicBrainzCacheKey(suggestion: Suggestion, groupingMode: ImportGroupingMode): string {
+    return [
+        normalizeLibraryText(suggestion.suggestedArtist ?? ""),
+        normalizeLibraryText(suggestion.suggestedTitle ?? ""),
+        groupingMode === "artist-song" ? "" : normalizeLibraryText(suggestion.suggestedAlbum ?? ""),
+    ].join("\u0000");
+}
+
+async function applyMusicBrainzLookupToSuggestion(
+    suggestion: Suggestion,
+    groupingMode: ImportGroupingMode,
+    lookupPromise: Promise<MusicBrainzLookupResult> | MusicBrainzLookupResult,
+): Promise<Suggestion> {
+    try {
+        const lookup = await lookupPromise;
+        const bestRecording = chooseBestMusicBrainzRecording(lookup.recordings, {
+            artist: suggestion.suggestedArtist,
+            title: suggestion.suggestedTitle,
+            album: suggestion.suggestedAlbum,
+        });
+        const bestRelease = chooseBestMusicBrainzRelease(bestRecording, { album: suggestion.suggestedAlbum });
+        const bestArtist = lookup.artists[0] ?? null;
+
+        if (!bestRecording && !bestArtist) {
+            return suggestion;
+        }
+
+        const confidenceBoost = bestRecording ? Math.max(0.8, Math.min(0.98, bestRecording.score / 100)) : Math.max(0.7, Math.min(0.9, (bestArtist?.score ?? 0) / 100));
+        return {
+            ...suggestion,
+            suggestedArtist: bestRecording?.artist || bestArtist?.name || suggestion.suggestedArtist,
+            suggestedTitle: bestRecording?.title || suggestion.suggestedTitle,
+            suggestedAlbum: groupingMode === "artist-song" ? undefined : bestRelease?.title || suggestion.suggestedAlbum,
+            confidence: Math.max(suggestion.confidence, clamp(confidenceBoost)),
+            reviewRequired: suggestion.reviewRequired && (!bestRecording || confidenceBoost < 0.9),
+        };
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+            ...suggestion,
+            reviewRequired: true,
+            statusMessage: [suggestion.statusMessage, `MusicBrainz lookup unavailable: ${message}`].filter(Boolean).join(" "),
+        };
+    }
 }
 
 function buildSuggestion(input: {

@@ -1,6 +1,6 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@^1.0.17";
 
-import { buildRecordingQuery, chooseBestMusicBrainzRecording, lookupMusicBrainzMetadata } from "./musicbrainz.ts";
+import { buildRecordingQuery, chooseBestMusicBrainzRecording, chooseBestMusicBrainzRelease, lookupMusicBrainzMetadata } from "./musicbrainz.ts";
 
 Deno.test("MusicBrainz recording query includes available metadata only", () => {
     assertEquals(buildRecordingQuery({ artist: "King Gizzard", title: "Robot Stop", album: "Nonagon Infinity" }), 'recording:"Robot Stop" AND artist:"King Gizzard" AND release:"Nonagon Infinity"');
@@ -74,23 +74,144 @@ Deno.test("MusicBrainz lookup tolerates malformed JSON shapes", async () => {
     assertEquals(result.recordings, []);
 });
 
+Deno.test("MusicBrainz lookup cleans noisy fields and can fallback without album", async () => {
+    const seenQueries: string[] = [];
+    const fetcher = async (input: string | URL | Request): Promise<Response> => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        const query = url.searchParams.get("query") ?? "";
+        seenQueries.push(query);
+        if (url.pathname.endsWith("/artist")) {
+            return Response.json({ artists: [{ id: "metallica", name: "Metallica", score: "100" }] });
+        }
+        if (query.includes("release:")) {
+            return Response.json({ recordings: [] });
+        }
+        return Response.json({
+            recordings: [{
+                id: "frantic",
+                title: "Frantic",
+                score: "100",
+                "artist-credit": [{ name: "Metallica" }],
+                releases: [{ id: "st-anger", title: "St. Anger", date: "2003" }],
+            }],
+        });
+    };
+
+    const result = await lookupMusicBrainzMetadata(
+        { artist: "Metallica!!!!", title: "frantic", album: "Saint Anger" },
+        {
+            baseUrl: "https://example.test/ws/2",
+            fetcher,
+            fallbackOnNoRecording: true,
+            userAgent: "its-mytabs-test/1.0 (test@example.com)",
+        },
+    );
+
+    assertEquals(seenQueries[0], 'artist:"Metallica"');
+    assertEquals(seenQueries[1], 'recording:"frantic" AND artist:"Metallica" AND release:"Saint Anger"');
+    assertEquals(seenQueries[2], 'recording:"frantic" AND artist:"Metallica"');
+    assertEquals(result.recordings[0].artist, "Metallica");
+    assertEquals(result.recordings[0].releases[0].title, "St. Anger");
+});
+
+Deno.test("MusicBrainz lookup can fallback to title-only recording search", async () => {
+    const seenQueries: string[] = [];
+    const fetcher = async (input: string | URL | Request): Promise<Response> => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        const query = url.searchParams.get("query") ?? "";
+        seenQueries.push(query);
+        if (url.pathname.endsWith("/artist")) {
+            return Response.json({ artists: [] });
+        }
+        if (query.includes("artist:")) {
+            return Response.json({ recordings: [] });
+        }
+        return Response.json({
+            recordings: [{
+                id: "frantic-title-only",
+                title: "Frantic",
+                score: "70",
+                "artist-credit": [{ name: "Metallica" }],
+                releases: [{ id: "st-anger", title: "St. Anger", date: "2003" }],
+            }],
+        });
+    };
+
+    const result = await lookupMusicBrainzMetadata(
+        { artist: "Metallica!!!!", title: "frantic", album: "" },
+        {
+            baseUrl: "https://example.test/ws/2",
+            fetcher,
+            fallbackOnNoRecording: true,
+            userAgent: "its-mytabs-test/1.0 (test@example.com)",
+        },
+    );
+
+    assertEquals(seenQueries, [
+        'artist:"Metallica"',
+        'recording:"frantic" AND artist:"Metallica"',
+        'recording:"frantic"',
+    ]);
+    assertEquals(result.recordings[0].id, "frantic-title-only");
+});
+
 Deno.test("MusicBrainz best recording selection favors exact local metadata", () => {
     const best = chooseBestMusicBrainzRecording([
         {
             id: "weak",
             title: "Other Song",
             artist: "Maintenance Artist",
-            releases: [{ id: "a", title: "Maintenance Album", date: "", score: 0 }],
+            releases: [{ id: "a", title: "Maintenance Album", date: "", status: "", primaryType: "", secondaryTypes: [], score: 0 }],
             score: 95,
         },
         {
             id: "exact",
             title: "Maintenance Song",
             artist: "Maintenance Artist",
-            releases: [{ id: "b", title: "Maintenance Album", date: "", score: 0 }],
+            releases: [{ id: "b", title: "Maintenance Album", date: "", status: "", primaryType: "", secondaryTypes: [], score: 0 }],
             score: 80,
         },
     ], { artist: "Maintenance Artist", title: "Maintenance Song", album: "Maintenance Album" });
 
     assertEquals(best?.id, "exact");
+});
+
+Deno.test("MusicBrainz release selection prefers canonical album over dated demos", () => {
+    const best = chooseBestMusicBrainzRelease({
+        id: "nirvana-where-did-you-sleep",
+        title: "Where Did You Sleep Last Night?",
+        artist: "Nirvana",
+        score: 95,
+        releases: [
+            {
+                id: "long-demo",
+                title: "1993-11-18: Unplugged & In Utero: The Demos: MTV Unplugged, Sony Studios, New York City, NY, USA",
+                date: "1993-11-18",
+                status: "Bootleg",
+                primaryType: "Album",
+                secondaryTypes: ["Demo", "Bootleg"],
+                score: 100,
+            },
+            {
+                id: "dated-live",
+                title: "1994 - MTV Unplugged In New York",
+                date: "1994",
+                status: "Official",
+                primaryType: "Album",
+                secondaryTypes: ["Live"],
+                score: 100,
+            },
+            {
+                id: "canonical",
+                title: "MTV Unplugged in New York",
+                date: "1994",
+                status: "Official",
+                primaryType: "Album",
+                secondaryTypes: ["Live"],
+                score: 98,
+            },
+        ],
+    });
+
+    assertEquals(best?.id, "canonical");
 });

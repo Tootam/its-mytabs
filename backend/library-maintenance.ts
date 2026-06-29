@@ -1,5 +1,5 @@
 import { db, withTransaction } from "./db.ts";
-import { LibraryArtistAlias, LibrarySong, LibraryTab, upsertAlbum, upsertArtistAlias, upsertSong } from "./library.ts";
+import { LibraryArtistAlias, LibrarySong, LibraryTab, upsertAlbum, upsertArtist, upsertArtistAlias, upsertSong } from "./library.ts";
 
 type SqlValue = string | number | bigint | null;
 type SqlRow = Record<string, SqlValue>;
@@ -111,6 +111,32 @@ export function assignSongAlbumByTitle(songId: number, albumTitle: string | null
         }
         const album = upsertAlbum(readNumber(song, "artist_id"), albumTitle);
         return moveSongToAlbum(songId, album.id);
+    });
+}
+
+export function applySongMetadata(songId: number, input: { artist: string; title: string; album?: string | null }): LibrarySong {
+    return withTransaction(() => {
+        requireSongRow(songId);
+        const artistName = input.artist.trim();
+        const title = input.title.trim();
+        const albumTitle = input.album?.trim() ?? "";
+        if (!artistName || !title) {
+            throw new Error("Artist and title are required");
+        }
+
+        const artist = upsertArtist(artistName);
+        const album = albumTitle ? upsertAlbum(artist.id, albumTitle) : null;
+        const targetSong = upsertSong(artist.id, title, album?.id ?? null);
+        if (targetSong.id !== songId) {
+            preservePreferredTab(songId, targetSong.id);
+            moveSongTabs(songId, targetSong.id);
+            db.prepare("DELETE FROM songs WHERE id = ?").run(songId);
+            refreshSongTabDenormalizedFields(targetSong.id);
+            return mapSong(requireSongRow(targetSong.id));
+        }
+
+        refreshSongTabDenormalizedFields(songId);
+        return mapSong(requireSongRow(songId));
     });
 }
 

@@ -7,6 +7,7 @@ Deno.env.set("MYTABS_PORT", "47779");
 
 const {
     assignSongAlbumByTitle,
+    applySongMetadata,
     createArtistAlias,
     mergeArtists,
     moveTabVersion,
@@ -232,6 +233,7 @@ Deno.test("library browse groups artist album song versions and preferred tab", 
             id: secondVersion.id,
             title: secondVersion.title,
             artist: secondVersion.artist,
+            album: secondVersion.album,
             filename: secondVersion.filename,
             originalFilename: secondVersion.originalFilename,
             createdAt: secondVersion.createdAt,
@@ -336,6 +338,28 @@ Deno.test("maintenance tools move versions, split songs, and clean album assignm
     assertEquals(removed.albumId, null);
     const noAlbumRow = db.prepare("SELECT album FROM tabs WHERE id = ?").get(firstTab.id) as Record<string, unknown>;
     assertEquals(noAlbumRow.album, "");
+});
+
+Deno.test("maintenance tools apply song metadata across existing tab versions", () => {
+    const artist = upsertArtist("Retag Old Artist");
+    const song = upsertSong(artist.id, "Retag Old Song");
+    const firstTab = upsertLibraryTab({ id: "retag-first", songId: song.id, public: true });
+    const secondTab = upsertLibraryTab({ id: "retag-second", songId: song.id, fav: true });
+
+    const updated = applySongMetadata(song.id, {
+        artist: "Retag New Artist",
+        title: "Retag New Song",
+        album: "Retag New Album",
+    });
+
+    assertEquals(updated.title, "Retag New Song");
+    const rows = db.prepare("SELECT title, artist, album, public, fav FROM tabs WHERE id IN (?, ?) ORDER BY id").all(firstTab.id, secondTab.id) as Array<Record<string, unknown>>;
+    assertEquals(rows.length, 2);
+    assertEquals(rows.every((row) => row.title === "Retag New Song"), true);
+    assertEquals(rows.every((row) => row.artist === "Retag New Artist"), true);
+    assertEquals(rows.every((row) => row.album === "Retag New Album"), true);
+    assertEquals(rows[0].public, 1);
+    assertEquals(rows[1].fav, 1);
 });
 
 Deno.test("maintenance version allocation skips soft-deleted versions", () => {
