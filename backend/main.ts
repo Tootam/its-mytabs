@@ -40,6 +40,7 @@ import * as cheerio from "cheerio";
 import { registerImportRoutes } from "./import-routes.ts";
 import { reconcileInterruptedImportJobs } from "./import.ts";
 import { registerLibraryMaintenanceRoutes } from "./library-maintenance-routes.ts";
+import { applySongMetadata } from "./library-maintenance.ts";
 import {
     canReadLibraryTab,
     deleteLibraryTab,
@@ -51,7 +52,7 @@ import {
     getLibraryTabStoredPath,
     setPreferredSongTab,
     updateLibraryTabFav,
-    updateLibraryTabInfo,
+    updateLibraryTabVisibility,
 } from "./library.ts";
 import { resolveStoredPath } from "./storage.ts";
 import { migrateLegacyTabsToLibrary } from "./legacy-migration.ts";
@@ -357,10 +358,16 @@ export async function main() {
                 const tab = await getTab(id);
                 await updateTab(tab, data);
             } catch (error) {
-                if (!getLibraryTab(id)) {
+                const libraryTab = getLibraryTab(id);
+                if (!libraryTab) {
                     throw error;
                 }
-                updateLibraryTabInfo(id, data);
+                applySongMetadata(libraryTab.songId, {
+                    artist: data.artist,
+                    title: data.title,
+                    album: data.album,
+                });
+                updateLibraryTabVisibility(id, data.public);
             }
             return c.json({
                 ok: true,
@@ -978,13 +985,12 @@ export async function main() {
         }
     });
 
-    registerImportRoutes(app);
-    registerLibraryMaintenanceRoutes(app, {
-        musicBrainz: {
-            userAgent: Deno.env.get("MYTABS_MUSICBRAINZ_USER_AGENT") ?? `its-mytabs/${appVersion} (${Deno.env.get("MYTABS_CONTACT_EMAIL") ?? "contact unavailable"})`,
-            timeoutMs: Number(Deno.env.get("MYTABS_MUSICBRAINZ_TIMEOUT_MS") ?? 10_000),
-        },
-    });
+    const musicBrainz = {
+        userAgent: Deno.env.get("MYTABS_MUSICBRAINZ_USER_AGENT") ?? `its-mytabs/${appVersion} (${Deno.env.get("MYTABS_CONTACT_EMAIL") ?? "https://github.com/louislam/its-mytabs"})`,
+        timeoutMs: Number(Deno.env.get("MYTABS_MUSICBRAINZ_TIMEOUT_MS") ?? 10_000),
+    };
+    registerImportRoutes(app, { musicBrainz });
+    registerLibraryMaintenanceRoutes(app, { enabled: true, musicBrainz });
 
     app.get("/", (c) => {
         return c.html(indexHTML);

@@ -1,8 +1,9 @@
 import { Context, Hono } from "@hono/hono";
 import { checkLogin } from "./auth.ts";
 import { db } from "./db.ts";
-import { assignSongAlbumByTitle, createArtistAlias, mergeArtists, moveSongToAlbum, moveTabVersion, splitTabToSong } from "./library-maintenance.ts";
-import { chooseBestMusicBrainzRecording, lookupMusicBrainzMetadata, MusicBrainzLookupOptions } from "./musicbrainz.ts";
+import { applySongMetadata, assignSongAlbumByTitle, createArtistAlias, mergeArtists, moveSongToAlbum, moveTabVersion, splitTabToSong } from "./library-maintenance.ts";
+import { getLibraryTab } from "./library.ts";
+import { chooseBestMusicBrainzRecording, chooseBestMusicBrainzRelease, lookupMusicBrainzMetadata, MusicBrainzLookupOptions } from "./musicbrainz.ts";
 import { routeError } from "./route-errors.ts";
 import {
     AssignSongAlbumByTitleSchema,
@@ -11,6 +12,7 @@ import {
     MoveSongToAlbumSchema,
     MoveTabVersionSchema,
     MusicBrainzEnrichSongSchema,
+    MusicBrainzEnrichTabSchema,
     MusicBrainzLookupSchema,
     SplitTabToSongSchema,
 } from "./zod.ts";
@@ -135,10 +137,45 @@ export function registerLibraryMaintenanceRoutes(app: Hono, options: RegisterLib
             const lookup = await lookupMusicBrainzMetadata(lookupInput, {
                 ...options.musicBrainz,
                 limit: input.limit ?? options.musicBrainz?.limit,
+                fallbackOnNoRecording: true,
             });
             const bestRecording = chooseBestMusicBrainzRecording(lookup.recordings, lookupInput);
-            const bestRelease = bestRecording?.releases[0] ?? null;
+            const bestRelease = chooseBestMusicBrainzRelease(bestRecording, { album: lookupInput.album });
             const song = input.applyBestReleaseAlbum && bestRelease ? assignSongAlbumByTitle(input.songId, bestRelease.title) : null;
+            return c.json({ ok: true, lookup, bestRecording, applied: song !== null, song });
+        } catch (error) {
+            return maintenanceRouteError(c, error);
+        }
+    });
+
+    app.post("/api/library-maintenance/tabs/:tabId/musicbrainz/enrich", async (c) => {
+        try {
+            await requireLogin(c);
+            const tab = getLibraryTab(c.req.param("tabId"));
+            if (!tab) {
+                throw new Error("Tab not found");
+            }
+            const input = MusicBrainzEnrichTabSchema.parse(await c.req.json());
+            const local = getSongLookupContext(tab.songId);
+            const lookupInput = {
+                artist: input.artist ?? local.artist,
+                title: input.title ?? local.title,
+                album: input.album ?? local.album,
+            };
+            const lookup = await lookupMusicBrainzMetadata(lookupInput, {
+                ...options.musicBrainz,
+                limit: input.limit ?? options.musicBrainz?.limit,
+                fallbackOnNoRecording: true,
+            });
+            const bestRecording = chooseBestMusicBrainzRecording(lookup.recordings, lookupInput);
+            const bestRelease = chooseBestMusicBrainzRelease(bestRecording, { album: lookupInput.album });
+            const song = bestRecording
+                ? applySongMetadata(tab.songId, {
+                    artist: bestRecording.artist || lookupInput.artist,
+                    title: bestRecording.title,
+                    album: input.applyBestReleaseAlbum ? bestRelease?.title ?? lookupInput.album : lookupInput.album,
+                })
+                : null;
             return c.json({ ok: true, lookup, bestRecording, applied: song !== null, song });
         } catch (error) {
             return maintenanceRouteError(c, error);

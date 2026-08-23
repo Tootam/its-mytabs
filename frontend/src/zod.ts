@@ -39,6 +39,7 @@ export const ImportJobSchema = z.object({
     rootPath: NullableStringSchema,
     copyMode: z.string().optional().default("copy"),
     groupingMode: ImportGroupingModeSchema,
+    musicBrainzEnabled: ApiBooleanSchema.default(false),
     status: ImportJobStatusSchema,
     totalCount: z.number().int().nonnegative().optional().default(0),
     importedCount: z.number().int().nonnegative().optional().default(0),

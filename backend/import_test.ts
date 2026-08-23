@@ -141,6 +141,98 @@ Deno.test("paginated import items and grouped review use suggested metadata", as
     assertEquals(groups.groups.every((group) => group.suggestedAlbum === "Album One"), true);
 });
 
+Deno.test("import scan can enrich suggested metadata from MusicBrainz", async () => {
+    const root = await makeImportRoot("musicbrainz");
+    await Deno.writeTextFile(path.join(root, "Rough Artist - Rough Title.gp"), "musicbrainz");
+    Deno.env.set("MYTABS_IMPORT_ROOTS", root);
+
+    const job = await createImportJob({
+        sourceType: "server-folder",
+        rootPath: root,
+        copyMode: "copy",
+        groupingMode: "artist-album-song",
+        musicBrainzEnabled: true,
+    });
+    assertEquals(job.musicBrainzEnabled, true);
+
+    await scanImportJob(job.id, {
+        musicBrainz: {
+            userAgent: "its-mytabs-test/1.0 (test@example.com)",
+            fetcher: async (url) => {
+                const pathname = new URL(String(url)).pathname;
+                if (pathname.endsWith("/artist")) {
+                    return jsonResponse({
+                        artists: [
+                            { id: "artist-1", name: "Canonical Artist", score: 100 },
+                        ],
+                    });
+                }
+                return jsonResponse({
+                    recordings: [
+                        {
+                            id: "recording-1",
+                            title: "Canonical Title",
+                            score: 100,
+                            "artist-credit": [{ name: "Canonical Artist" }],
+                            releases: [{ id: "release-1", title: "Canonical Album", score: 100 }],
+                        },
+                    ],
+                });
+            },
+        },
+    });
+
+    const item = listImportItems(job.id, { limit: 10, offset: 0 }).items[0];
+    assertEquals(item.suggestedArtist, "Canonical Artist");
+    assertEquals(item.suggestedTitle, "Canonical Title");
+    assertEquals(item.suggestedAlbum, "Canonical Album");
+    assertEquals(item.confidence, 0.98);
+});
+
+Deno.test("import MusicBrainz enrichment reuses lookups for repeated metadata", async () => {
+    const root = await makeImportRoot("musicbrainz-cache");
+    await fs.ensureDir(path.join(root, "one"));
+    await fs.ensureDir(path.join(root, "two"));
+    await Deno.writeTextFile(path.join(root, "one", "Cached Artist - Cached Title.gp"), "one");
+    await Deno.writeTextFile(path.join(root, "two", "Cached Artist - Cached Title.gp"), "two");
+    Deno.env.set("MYTABS_IMPORT_ROOTS", root);
+
+    let requestCount = 0;
+    const job = await createImportJob({
+        sourceType: "server-folder",
+        rootPath: root,
+        copyMode: "copy",
+        groupingMode: "artist-song",
+        musicBrainzEnabled: true,
+    });
+
+    await scanImportJob(job.id, {
+        musicBrainz: {
+            userAgent: "its-mytabs-test/1.0 (test@example.com)",
+            fetcher: async (url) => {
+                requestCount++;
+                const pathname = new URL(String(url)).pathname;
+                if (pathname.endsWith("/artist")) {
+                    return jsonResponse({ artists: [{ id: "artist-1", name: "Cached Artist", score: 100 }] });
+                }
+                return jsonResponse({
+                    recordings: [{
+                        id: "recording-1",
+                        title: "Cached Title",
+                        score: 100,
+                        "artist-credit": [{ name: "Cached Artist" }],
+                        releases: [],
+                    }],
+                });
+            },
+        },
+    });
+
+    const page = listImportItems(job.id, { limit: 10, offset: 0 });
+    assertEquals(page.total, 2);
+    assertEquals(requestCount, 2);
+});
+
 Deno.test("exact duplicate import links source path during commit", async () => {
     const root = await makeImportRoot("exact");
     const sourcePath = path.join(root, "Dup Artist - Dup Song.gp");
@@ -340,4 +432,13 @@ async function waitForImportJob(jobId: string, status: string) {
 async function hashFile(filePath: string): Promise<{ sha256: string; byteSize: number }> {
     const file = await Deno.open(filePath, { read: true });
     return await hashReadableStream(file.readable);
+}
+
+function jsonResponse(data: unknown): Response {
+    return new Response(JSON.stringify(data), {
+        status: 200,
+        headers: {
+            "Content-Type": "application/json",
+        },
+    });
 }

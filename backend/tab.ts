@@ -5,7 +5,18 @@ import { AudioData, AudioDataSchema, ConfigJSON, ConfigJSONSchema, SyncRequest, 
 import { kv, withTransaction } from "./db.ts";
 import sanitize from "sanitize-filename";
 import { supportedAudioFormatList, supportedFormatList } from "./common.ts";
-import { deleteLibraryTab, getLibraryConfigJSON, getLibraryTab, upsertArtist, upsertLegacyTabConfig, upsertLibraryTab, upsertSong, upsertTabFile, upsertTabFileSource } from "./library.ts";
+import {
+    deleteLibraryTab,
+    getLibraryConfigJSON,
+    getLibraryTab,
+    upsertAlbum,
+    upsertArtist,
+    upsertLegacyTabConfig,
+    upsertLibraryTab,
+    upsertSong,
+    upsertTabFile,
+    upsertTabFileSource,
+} from "./library.ts";
 import { storeLibraryFile } from "./storage.ts";
 
 const updateQueues = new Map<string, Promise<ConfigJSON>>();
@@ -355,6 +366,7 @@ async function getNextID(): Promise<number> {
 export async function updateTab(tab: TabInfo, data: UpdateTabInfo) {
     tab.title = data.title;
     tab.artist = data.artist;
+    tab.album = data.album;
     tab.public = data.public;
     await writeTabInfo(tab);
     const config = await getConfigJSON(tab.id, true);
@@ -507,7 +519,8 @@ async function syncLibraryTabFromConfig(config: ConfigJSON, tabFileData?: Uint8A
 
     withTransaction(() => {
         const artist = upsertArtist(tab.artist || "Unknown Artist");
-        const song = upsertSong(artist.id, tab.title || tab.id);
+        const album = tab.album ? upsertAlbum(artist.id, tab.album) : null;
+        const song = upsertSong(artist.id, tab.title || tab.id, album?.id ?? null);
         const libraryTab = upsertLibraryTab({
             id: tab.id,
             songId: song.id,

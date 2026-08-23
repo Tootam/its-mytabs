@@ -258,6 +258,7 @@ Deno.test("updateTab", async () => {
     await updateTab(tab, {
         title: "Updated Title",
         artist: "Updated Artist",
+        album: "Updated Album",
         public: true,
     });
 
@@ -265,9 +266,11 @@ Deno.test("updateTab", async () => {
     tab = await getTab(id);
     assertEquals(tab.title, "Updated Title");
     assertEquals(tab.artist, "Updated Artist");
+    assertEquals(tab.album, "Updated Album");
     assertEquals(tab.public, true);
     assertEquals(getLibraryTabInfo(id)?.title, "Updated Title");
     assertEquals(getLibraryTabInfo(id)?.artist, "Updated Artist");
+    assertEquals(getLibraryTabInfo(id)?.album, "Updated Album");
     assertEquals(getLibraryTabInfo(id)?.public, true);
 });
 

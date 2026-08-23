@@ -9,6 +9,7 @@ export function mapJob(row: SqlRow): ImportJob {
         rootPath: readNullableString(row, "root_path"),
         copyMode: readString(row, "copy_mode"),
         groupingMode: readString(row, "grouping_mode") as ImportGroupingMode,
+        musicBrainzEnabled: readBoolean(row, "musicbrainz_enabled"),
         status: readString(row, "status") as ImportJobStatus,
         totalCount: readNumber(row, "total_count"),
         importedCount: readNumber(row, "imported_count"),

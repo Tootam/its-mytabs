@@ -144,6 +144,10 @@ export default defineComponent({
         isCurrentPreferredVersion() {
             return !!this.currentVersion?.preferred;
         },
+
+        displayAlbum() {
+            return this.currentVersion?.album || this.tab.album || "";
+        },
     },
 
     watch: {
@@ -1850,6 +1854,10 @@ export default defineComponent({
     <div class="main" :class='{ "light": this.setting.scoreColor === "light" }'>
         <h1>{{ tab.title }}</h1>
         <h2>{{ tab.artist }}</h2>
+        <div v-if="displayAlbum" class="tab-album">
+            <span>Album</span>
+            {{ displayAlbum }}
+        </div>
         <div class="version-switcher" v-if="versionSong">
             <BDropdown
                 v-if="canSwitchVersions"
@@ -2035,7 +2043,8 @@ $youtube-height: 200px;
         padding-top: 30px;
 
         h1,
-        h2 {
+        h2,
+        .tab-album {
             color: #333;
         }
     }
@@ -2176,6 +2185,22 @@ h2 {
     margin-bottom: 0;
 }
 
+.tab-album {
+    text-align: center;
+    color: #aeb4bb;
+    font-size: 16px;
+    margin-top: 6px;
+
+    span {
+        color: #7f8a93;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        margin-right: 8px;
+        text-transform: uppercase;
+    }
+}
+
 $color: #32393e;
 $padding: 20px;
 
@@ -2286,6 +2311,10 @@ $padding: 20px;
 
     h2 {
         font-size: 16px;
+    }
+
+    .tab-album {
+        font-size: 14px;
     }
 
     .list {

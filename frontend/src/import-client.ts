@@ -5,6 +5,7 @@ import type { ImportDecision, ImportGroupingMode, ImportItem, ImportItemsPage, I
 export interface CreateImportJobInput {
     rootPath: string;
     groupingMode: ImportGroupingMode;
+    musicBrainzEnabled?: boolean;
 }
 
 export interface ImportReviewFilters {
@@ -58,6 +59,7 @@ export async function createImportJob(input: CreateImportJobInput): Promise<Impo
             sourceType: "server-folder",
             rootPath: input.rootPath,
             groupingMode: input.groupingMode,
+            musicBrainzEnabled: input.musicBrainzEnabled ?? false,
         }),
     });
 

@@ -175,6 +175,7 @@ export async function migrateLibrarySchema() {
             root_path TEXT,
             copy_mode TEXT NOT NULL DEFAULT 'copy',
             grouping_mode TEXT NOT NULL DEFAULT 'auto',
+            musicbrainz_enabled INTEGER NOT NULL DEFAULT 0 CHECK(musicbrainz_enabled IN (0, 1)),
             status TEXT NOT NULL CHECK(status IN ('created', 'scanning', 'ready_for_review', 'committing', 'completed', 'failed', 'canceled')),
             total_count INTEGER NOT NULL DEFAULT 0 CHECK(total_count >= 0),
             imported_count INTEGER NOT NULL DEFAULT 0 CHECK(imported_count >= 0),
@@ -245,7 +246,16 @@ export async function migrateLibrarySchema() {
         CREATE INDEX IF NOT EXISTS idx_import_items_status_selection ON import_items(status, selected);
     `);
 
+    addColumnIfMissing("import_jobs", "musicbrainz_enabled", "INTEGER NOT NULL DEFAULT 0 CHECK(musicbrainz_enabled IN (0, 1))");
+
     db.prepare("INSERT OR IGNORE INTO library_migrations (id, applied_at) VALUES (?, ?)").run(migrationId, appliedAt);
+}
+
+function addColumnIfMissing(table: string, column: string, definition: string): void {
+    const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!rows.some((row) => row.name === column)) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
 }
 
 export async function addDemoTab() {

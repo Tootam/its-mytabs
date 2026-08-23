@@ -13,10 +13,15 @@ import {
     startImportJobCommit,
     startImportJobScan,
 } from "./import.ts";
+import { MusicBrainzLookupOptions } from "./musicbrainz.ts";
 import { routeError } from "./route-errors.ts";
 import { BulkImportItemsSchema, CreateImportJobSchema, ImportItemsQuerySchema, PatchImportItemSchema } from "./zod.ts";
 
-export function registerImportRoutes(app: Hono): void {
+interface RegisterImportRouteOptions {
+    musicBrainz?: MusicBrainzLookupOptions;
+}
+
+export function registerImportRoutes(app: Hono, options: RegisterImportRouteOptions = {}): void {
     app.post("/api/import-jobs", async (c) => {
         try {
             await checkLogin(c);
@@ -53,7 +58,9 @@ export function registerImportRoutes(app: Hono): void {
     app.post("/api/import-jobs/:jobId/scan", async (c) => {
         try {
             await checkLogin(c);
-            const job = await startImportJobScan(c.req.param("jobId"));
+            const job = await startImportJobScan(c.req.param("jobId"), {
+                musicBrainz: options.musicBrainz,
+            });
             return c.json({ ok: true, job });
         } catch (error) {
             return importRouteError(c, error);
