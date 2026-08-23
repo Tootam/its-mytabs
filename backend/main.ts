@@ -6,7 +6,7 @@ import { LibraryBrowseQuerySchema, SetPreferredTabSchema, SignUpSchema, SyncRequ
 import { db, hasUser, isInitDB, kv, migrate } from "./db.ts";
 import { cors } from "@hono/hono/cors";
 import { serveStatic } from "@hono/hono/deno";
-import { appVersion, checkFilename, dataDir, devOriginList, getFrontendDir, getSourceDir, host, isDemoMode, isDev, port, start, tabDir } from "./util.ts";
+import { appVersion, checkFilename, dataDir, devOriginList, getFrontendDir, getSourceDir, host, isAuthDisabled, isDemoMode, isDev, port, start, tabDir } from "./util.ts";
 import * as path from "@std/path";
 import { supportedAudioFormatList, supportedFormatList } from "./common.ts";
 import {
@@ -96,11 +96,17 @@ export async function main() {
 
     // Inject demo mode flag using cheerio
     const $ = cheerio.load(indexHTMLContent);
-    $("head").append(`<script id="app-config" type="application/json">${JSON.stringify({ isDemo: isDemoMode, defaultImportRoot: getDefaultImportRoot() })}</script>`);
+    $("head").append(
+        `<script id="app-config" type="application/json">${JSON.stringify({ isDemo: isDemoMode, authDisabled: isAuthDisabled, defaultImportRoot: getDefaultImportRoot() })}</script>`,
+    );
     const indexHTML = $.html();
 
     if (isDemoMode) {
         console.warn("Running in DEMO MODE.");
+    }
+
+    if (isAuthDisabled) {
+        console.warn("Authentication is disabled. Make sure access is controlled by a trusted reverse proxy or private network.");
     }
 
     const app = new Hono();
@@ -157,6 +163,10 @@ export async function main() {
     // Register Admin account
     app.post("/register", async (c) => {
         try {
+            if (isAuthDisabled) {
+                return c.json({ error: "Authentication is disabled" }, 403);
+            }
+
             if (hasUser()) {
                 return c.json({ error: "User already exists" }, 400);
             }
