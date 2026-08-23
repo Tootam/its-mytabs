@@ -70,6 +70,8 @@ export default defineComponent({
             selectedTrack: 0,
             soloTrackID: -1,
             muteTrackList: {},
+            masterVolume: 100,
+            trackVolumeList: {},
             currentAudio: "synth",
             youtubeList: [],
             audioList: [],
@@ -921,6 +923,7 @@ export default defineComponent({
                 // this right after a source switch (while the range is saved),
                 // and on a later tick once the re-initialized player settles.
                 this.api.playerReady.on(() => {
+                    this.applyTrackVolumes();
                     this.restorePlaybackRange();
                     if (this.savedPlaybackRange) {
                         setTimeout(() => this.seekToHighlightedRangeStart(), 0);
@@ -1029,6 +1032,8 @@ export default defineComponent({
                             program: track.playbackInfo.program,
                         });
                     });
+                    this.initializeTrackVolumes(score.tracks);
+                    this.applyTrackVolumes();
 
                     this.selectedTrack = trackID;
 
@@ -1072,6 +1077,8 @@ export default defineComponent({
             this.speed = 100;
             this.scrollMode = ScrollMode.Continuous;
             this.soloTrackID = -1;
+            this.masterVolume = 100;
+            this.trackVolumeList = {};
             this.youtube = {};
             this.versionSong = null;
             this.simpleSyncSecond = -1;
@@ -1742,12 +1749,74 @@ export default defineComponent({
             ], mute);
         },
 
-        toggleVolume(trackID, volume) {
-            if (!this.api) {
+        normalizeVolume(volume, fallback = 100) {
+            const parsedVolume = typeof volume === "string" && volume.trim() === "" ? Number.NaN : Number(volume);
+            if (!Number.isFinite(parsedVolume)) {
+                return fallback;
+            }
+            return Math.min(1000, Math.max(0, parsedVolume));
+        },
+
+        initializeTrackVolumes(tracks) {
+            const masterVolume = this.normalizeVolume(this.getConfig("masterVolume", 100));
+            const savedTrackVolumeList = this.getConfig("trackVolumeList", {});
+            const validSavedTrackVolumeList = savedTrackVolumeList && typeof savedTrackVolumeList === "object" && !Array.isArray(savedTrackVolumeList) ? savedTrackVolumeList : {};
+            const trackVolumeList = {};
+
+            for (const track of tracks) {
+                trackVolumeList[track.index] = this.normalizeVolume(validSavedTrackVolumeList[track.index], masterVolume);
+            }
+
+            this.masterVolume = masterVolume;
+            this.trackVolumeList = trackVolumeList;
+        },
+
+        applyTrackVolumes() {
+            if (!this.api?.score?.tracks) {
                 return;
             }
+
+            for (const track of this.api.score.tracks) {
+                const volume = this.normalizeVolume(this.trackVolumeList[track.index], this.masterVolume);
+                this.api.changeTrackVolume([track], volume / 100);
+            }
+        },
+
+        setMasterVolume(volume) {
+            if (!this.api?.score?.tracks) {
+                return;
+            }
+
+            const normalizedVolume = this.normalizeVolume(volume, this.masterVolume);
+            const trackVolumeList = {};
+            for (const track of this.api.score.tracks) {
+                trackVolumeList[track.index] = normalizedVolume;
+            }
+
+            this.masterVolume = normalizedVolume;
+            this.trackVolumeList = trackVolumeList;
+            this.api.changeTrackVolume(this.api.score.tracks, normalizedVolume / 100);
+            this.setConfig("masterVolume", normalizedVolume);
+            this.setConfig("trackVolumeList", trackVolumeList);
+        },
+
+        setTrackVolume(trackID, volume) {
+            if (!this.api?.score?.tracks) {
+                return;
+            }
+
             const track = this.api.score.tracks.find(({ index }) => index === trackID);
-            this.api.changeTrackVolume(track, volume / 100);
+            if (!track) {
+                return;
+            }
+
+            const normalizedVolume = this.normalizeVolume(volume, this.trackVolumeList[trackID] ?? this.masterVolume);
+            this.trackVolumeList = {
+                ...this.trackVolumeList,
+                [trackID]: normalizedVolume,
+            };
+            this.api.changeTrackVolume([track], normalizedVolume / 100);
+            this.setConfig("trackVolumeList", this.trackVolumeList);
         },
 
         edit() {
@@ -1960,12 +2029,19 @@ export default defineComponent({
                     <font-awesome-icon :icon='["fas", "xmark"]' class="me-2 close" @click="showTrackList = false" />
                 </div>
 
+                <div class="master-volume item">
+                    <div class="name">Master</div>
+                    <div class="list-button select-percentage">
+                        Volume: <input type="number" min="0" max="1000" step="1" :value="masterVolume" @input="setMasterVolume($event.target.value)" /> (%)
+                    </div>
+                </div>
+
                 <div class="track item" v-for="track in tracks" :key="track.id" :class="{ active: selectedTrack === track.id }">
                     <div class="name" @click="changeTrack(track.id)">{{ track.name }}</div>
                     <div class="list-button solo" @click="toggleSolo(track.id)" :class="{ active: soloTrackID === track.id }">Solo</div>
                     <div class="list-button mute" @click="toggleMute(track.id)" :class="{ active: muteTrackList[track.id] }">Mute</div>
                     <div class="list-button select-percentage">
-                        Volume: <input type="number" min="0" max="1000" step="1" value="100" @change="toggleVolume(track.id, $event.target.value)" /> (%)
+                        Volume: <input type="number" min="0" max="1000" step="1" :value="trackVolumeList[track.id] ?? masterVolume" @input="setTrackVolume(track.id, $event.target.value)" /> (%)
                     </div>
                 </div>
             </div>
@@ -2267,7 +2343,8 @@ $padding: 20px;
 }
 
 .track-list {
-    .track {
+    .track,
+    .master-volume {
         .list-button {
             background-color: lighten($color, 10%);
             border-right: 1px solid darken($color, 5%);
