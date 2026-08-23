@@ -5,16 +5,20 @@
         "dev-frontend": "NODE_ENV=development vite",
         "dev": "cd .. && deno task dev",
         "build": "vite build",
-        "preview": "vite preview"
+        "preview": "vite preview",
+        "e2e": "playwright test --project=chromium",
+        "e2e-all": "playwright test"
     },
     "dependencies": {
+        "@foleyjs/core": "~2.7.0",
         "better-auth": "~1.4.17",
         "private-ip": "~3.0.2",
         "rollup-plugin-visualizer": "^6.0.3",
+        "wasm-media-encoders": "~0.7.0",
         "zod": "~4.1.11"
     },
     "devDependencies": {
-        "@coderline/alphatab-vite": "1.8.0",
+        "@coderline/alphatab-vite": "1.8.4",
         "@fortawesome/fontawesome-svg-core": "7.0.1",
         "@fortawesome/free-regular-svg-icons": "7.0.1",
         "@fortawesome/free-solid-svg-icons": "7.0.1",
@@ -27,13 +31,14 @@
         "sass-embedded": "~1.78.0",
         "typescript": "~5.8.3",
         "vite": "~7.3.1",
-        "@coderline/alphatab": "1.8.0",
+        "@coderline/alphatab": "1.8.4",
         "vue": "~3.5.21",
         "vue-router": "~4.5.1",
         "vue-i18n": "~11.1.12",
         "vite-plugin-compression": "~0.5.1",
         "socket.io-client": "~4.8.1",
         "bootstrap": "5.3.8",
-        "bootstrap-vue-next": "~0.40.4"
+        "bootstrap-vue-next": "~0.40.4",
+        "@playwright/test": "1.62.1"
     }
 }

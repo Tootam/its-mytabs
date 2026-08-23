@@ -1,11 +1,25 @@
 <script>
-import { ActionBuffer, baseURL, checkFetch, connectSocketIO, convertAlphaTexSyncPoint, generalError, getInstrumentName, getSetting, releaseWakeLock, requestWakeLock } from "../app.js";
+import {
+    ActionBuffer,
+    baseURL,
+    checkFetch,
+    connectSocketIO,
+    convertAlphaTexSyncPoint,
+    findPreferredTrack,
+    generalError,
+    getInstrumentName,
+    getSetting,
+    releaseWakeLock,
+    requestWakeLock,
+} from "../app.js";
 import { defineComponent } from "vue";
 import { BDropdown, BDropdownDivider, BDropdownItem } from "bootstrap-vue-next";
 import { notify } from "@kyvg/vue3-notification";
 import { FontAwesomeIcon } from "@fortawesome/vue-fontawesome";
 import { isLoggedIn } from "../auth-client.js";
 import { getKeySignature } from "../util.ts";
+import { countIn } from "../count-in.ts";
+import { setupSelection } from "../selection.ts";
 
 const alphaTab = await import("@coderline/alphatab");
 const { ScrollMode, StaveProfile } = alphaTab;
@@ -47,6 +61,8 @@ export default defineComponent({
             playing: false,
             enableCountIn: false,
             enableMetronome: false,
+            isCountingIn: false,
+            seekDownBeat: null,
             enableBackingTrack: true,
             isLooping: false,
             speed: 100,
@@ -62,6 +78,9 @@ export default defineComponent({
             scrollMode: ScrollMode.Continuous,
             keySignature: "",
             playbackRange: null,
+            savedPlaybackRange: null,
+            playbackRangeRestoreTimer: undefined,
+            selectionController: null,
 
             keyEvents: (e) => {
                 // Do not handle these tagName, because the only input is sync point, it is weird when play space to test the sync point
@@ -93,6 +112,7 @@ export default defineComponent({
             setting: {},
             simpleSyncSecond: -1,
             toolbarAutoHide: false,
+            isInitializingAudio: false, // Flag to prevent sync point clearing during audio init
         };
     },
     computed: {
@@ -136,8 +156,14 @@ export default defineComponent({
             await this.load(trackID);
         },
 
-        simpleSyncSecond(newVal, oldVal) {
+        async simpleSyncSecond(newVal, oldVal) {
             if (!this.api) {
+                return;
+            }
+
+            // Skip if we're in the middle of initializing audio to prevent clearing sync points
+            if (this.isInitializingAudio) {
+                console.log("Skipping simpleSyncSecond watcher during audio initialization");
                 return;
             }
 
@@ -210,9 +236,19 @@ export default defineComponent({
             if (this.playing) {
                 this.api.settings.player.scrollMode = this.scrollMode;
                 this.api.updateSettings();
-                this.api.play();
+
+                // alphaTab only supports count-in natively for the synthesizer player.
+                // For external audio sources, play a custom Web Audio count-in first.
+                if (this.enableCountIn && this.needsCustomCountIn()) {
+                    this.startExternalCountIn();
+                } else {
+                    this.api.play();
+                }
+
                 requestWakeLock();
             } else {
+                countIn.cancel();
+                this.isCountingIn = false;
                 this.api.pause();
                 releaseWakeLock();
             }
@@ -244,11 +280,7 @@ export default defineComponent({
             if (!this.api) {
                 return;
             }
-            if (this.enableCountIn) {
-                this.api.countInVolume = 1;
-            } else {
-                this.api.countInVolume = 0;
-            }
+            this.applyCountInVolume();
             this.setConfig("enableCountIn", this.enableCountIn);
         },
 
@@ -301,6 +333,16 @@ export default defineComponent({
 
             if (!this.api) {
                 return;
+            }
+
+            // alphaTab's native count-in only works on the synthesizer player, so reset
+            // its volume here to avoid a silent count-in running on external media.
+            this.applyCountInVolume();
+
+            // Save the playback range before switching audio source.
+            const range = this.api.playbackRange;
+            if (range) {
+                this.savedPlaybackRange = { startTick: range.startTick, endTick: range.endTick };
             }
 
             this.api.player.masterVolume = 1;
@@ -360,7 +402,7 @@ export default defineComponent({
                 this.setConfig("audio", audioParam);
             }
 
-            const trackID = this.getConfig("trackID", 0);
+            const trackID = this.getConfig("trackID", -1);
 
             // Load the AlphaTab
             await this.load(trackID);
@@ -547,6 +589,28 @@ export default defineComponent({
         },
 
         /**
+         * Start (or restart) playback.
+         *
+         * The `playing` watcher only reacts to state changes, so restarting while
+         * already playing (e.g. the "Restart" button) would never re-run the
+         * count-in. When count-in is enabled, stop first and count in again.
+         */
+        startPlayback() {
+            if (this.playing && this.enableCountIn) {
+                this.api.pause();
+
+                if (this.needsCustomCountIn()) {
+                    this.startExternalCountIn();
+                } else {
+                    // alphaTab runs its native count-in when play() is called from a paused state
+                    this.api.play();
+                }
+            } else {
+                this.play();
+            }
+        },
+
+        /**
          * Play from the beginning of highlighted range
          * Do nothing if no bar is highlighted
          */
@@ -561,8 +625,129 @@ export default defineComponent({
             }
 
             this.api.tickPosition = playbackRange.startTick;
-            this.play();
+            this.startPlayback();
             return true;
+        },
+
+        /**
+         * A stable identifier for a beat, used to tell a plain click on a beat
+         * from a drag-selection. Different model instances can represent the
+         * same logical beat (e.g. multiple voices), so compare bar + beat + tick.
+         * @param beat The beat from a beatMouseDown/beatMouseUp event
+         * @returns {string | null}
+         */
+        getBeatKey(beat) {
+            const modelBeat = beat ? beat.beat ?? beat : null;
+            const bar = modelBeat && modelBeat.voice ? modelBeat.voice.bar : null;
+            if (!bar) {
+                return null;
+            }
+            return `${bar.index}:${modelBeat.index}:${modelBeat.absolutePlaybackStart}`;
+        },
+
+        /**
+         * Whether the current audio source needs our custom Web Audio count-in.
+         * alphaTab only implements count-in natively for the synthesizer player,
+         * for external media the count-in is silent and playback starts instantly.
+         * @returns {boolean}
+         */
+        needsCustomCountIn() {
+            return (
+                this.currentAudio.startsWith("audio-") ||
+                this.currentAudio.startsWith("youtube-") ||
+                this.currentAudio === "backingTrack"
+            );
+        },
+
+        /**
+         * Apply the alphaTab count-in volume according to the current settings.
+         * Native count-in is only enabled on the synthesizer player, so external
+         * media doesn't trigger alphaTab's silent count-in.
+         */
+        applyCountInVolume() {
+            if (!this.api) {
+                return;
+            }
+            this.api.countInVolume = this.enableCountIn && this.currentAudio === "synth" ? 1 : 0;
+        },
+
+        /**
+         * Get the tempo and time signature at the current playback position,
+         * adjusted for the playback speed, to time the count-in beats.
+         * @returns {{ bpm: number, beats: number }}
+         */
+        getCountInInfo() {
+            const masterBars = this.api.score.masterBars;
+            const tick = this.api.tickPosition ?? 0;
+
+            let bar = masterBars[0];
+            for (const masterBar of masterBars) {
+                if (masterBar.start <= tick) {
+                    bar = masterBar;
+                } else {
+                    break;
+                }
+            }
+
+            let bpm = 120;
+            if (bar.tempoAutomations && bar.tempoAutomations.length > 0 && bar.tempoAutomations[0].value) {
+                bpm = bar.tempoAutomations[0].value;
+            }
+
+            const beats = bar.timeSignatureNumerator ?? 4;
+            const playbackSpeed = this.api.playbackSpeed ?? 1;
+            return { bpm: bpm * playbackSpeed, beats };
+        },
+
+        /**
+         * Play a count-in (one bar of metronome beats) via the Web Audio API,
+         * then start the actual playback. Used for external audio sources where
+         * alphaTab does not support count-in.
+         */
+        startExternalCountIn() {
+            countIn.cancel();
+            this.isCountingIn = true;
+
+            const { bpm, beats } = this.getCountInInfo();
+            countIn.start({
+                bpm,
+                beats,
+                onFinished: () => {
+                    this.isCountingIn = false;
+                    if (this.playing) {
+                        this.api.play();
+                    }
+                },
+            });
+        },
+
+        /**
+         * Restore the playback range that was saved before switching audio source.
+         */
+        restorePlaybackRange() {
+            if (!this.savedPlaybackRange || !this.api) {
+                return;
+            }
+            const range = this.savedPlaybackRange;
+            this.api.playbackRange = range;
+
+            clearTimeout(this.playbackRangeRestoreTimer);
+            this.playbackRangeRestoreTimer = setTimeout(() => {
+                this.savedPlaybackRange = null;
+                this.playbackRangeRestoreTimer = undefined;
+            }, 1500);
+        },
+
+        /**
+         * If a playback range is highlighted, move the cursor to its start.
+         * Switching audio sources re-creates the player / external element at
+         * position 0, which drags the cursor back to the first bar.
+         */
+        seekToHighlightedRangeStart() {
+            const range = this.api?.playbackRange;
+            if (range) {
+                this.api.tickPosition = range.startTick;
+            }
         },
 
         /**
@@ -613,7 +798,7 @@ export default defineComponent({
                 api.tickPosition = firstBeat.absoluteDisplayStart;
             }
 
-            this.play();
+            this.startPlayback();
         },
 
         getFileURL(tempToken) {
@@ -718,9 +903,48 @@ export default defineComponent({
                 // Exposing api to window for debugging
                 window.api = this.api;
 
+                // Custom selection handles + "click keeps the selection" behavior
+                this.selectionController = setupSelection(this.$refs.bassTabContainer, this.api);
+
                 // Used for showing/hiding the "Restart" button
                 this.api.playbackRangeChanged.on(() => {
                     this.playbackRange = this.api.playbackRange;
+                });
+
+                // Restore the saved playback range once the new player is ready.
+                // A source switch also resets the cursor to the first bar, so
+                // put it back at the highlighted range start as well. Only do
+                // this right after a source switch (while the range is saved),
+                // and on a later tick once the re-initialized player settles.
+                this.api.playerReady.on(() => {
+                    this.restorePlaybackRange();
+                    if (this.savedPlaybackRange) {
+                        setTimeout(() => this.seekToHighlightedRangeStart(), 0);
+                    }
+                });
+
+                // Clicking on the score seeks. When already playing with count-in
+                // enabled, restart from the clicked beat with a count-in.
+                this.api.beatMouseDown.on((beat) => {
+                    this.seekDownBeat = this.getBeatKey(beat);
+                });
+                this.api.beatMouseUp.on((beat) => {
+                    const downKey = this.seekDownBeat;
+                    this.seekDownBeat = null;
+
+                    // Only a plain click (same beat down/up), not a drag-selection
+                    if (!downKey || downKey !== this.getBeatKey(beat)) {
+                        return;
+                    }
+
+                    // When a range is selected, only clicks inside it count
+                    if (this.selectionController && !this.selectionController.isWithinSelection(beat)) {
+                        return;
+                    }
+
+                    if (this.playing && this.enableCountIn) {
+                        this.startPlayback();
+                    }
                 });
 
                 // iOS 16.4+: Enable audio playback even when silent switch is ON
@@ -739,9 +963,23 @@ export default defineComponent({
                     this.applyColors(score);
 
                     // Track
+                    // -1: never picked; auto-select the preferred instrument track
+                    if (trackID === -1) {
+                        trackID = findPreferredTrack(score.tracks, this.setting.preferredInstrument)?.index ?? 0;
+                    }
                     if (trackID < 0 || trackID >= score.tracks.length) {
                         trackID = 0;
                     }
+
+                    this.selectedTrack = trackID;
+
+                    if (this.isDrum()) {
+                        this.api.settings.display.staveProfile = StaveProfile.ScoreTab;
+                    } else {
+                        // This will break drum score
+                        this.overrideHiddenStaves(score);
+                    }
+
                     this.api.renderTracks([this.api.score.tracks[trackID]]);
 
                     // Always show tempo automation on the master bar
@@ -790,15 +1028,6 @@ export default defineComponent({
 
                     this.selectedTrack = trackID;
 
-                    // Force score+tab if the current track program = 0 (probably drums)
-                    if (this.isDrum()) {
-                        this.api.settings.display.staveProfile = StaveProfile.ScoreTab;
-                        this.api.updateSettings();
-                    } else {
-                        // This will break drum score
-                        this.overrideHiddenStaves(score);
-                    }
-
                     this.enableBackingTrack = this.hasBackingTrack();
 
                     this.ready = true;
@@ -808,6 +1037,14 @@ export default defineComponent({
                 this.api.playerFinished.on(() => {
                     if (!this.isLooping) {
                         this.playing = false;
+                    } else if (this.enableCountIn) {
+                        // Looping a highlighted range wraps back to its start and
+                        // keeps playing; count in again before the next iteration.
+                        const range = this.api.playbackRange;
+                        if (range) {
+                            this.api.tickPosition = range.startTick;
+                        }
+                        this.startPlayback();
                     }
                 });
             });
@@ -816,6 +1053,10 @@ export default defineComponent({
         destroyContainer() {
             this.api?.destroy();
             this.api = undefined;
+
+            // Remove custom selection handles + restore alphaTab's default method
+            this.selectionController?.clear();
+            this.selectionController = null;
 
             // Reset states
             this.ready = false;
@@ -832,6 +1073,12 @@ export default defineComponent({
             this.simpleSyncSecond = -1;
             this.muteTrackList = {};
             this.playbackRange = null;
+            this.savedPlaybackRange = null;
+            clearTimeout(this.playbackRangeRestoreTimer);
+            this.playbackRangeRestoreTimer = undefined;
+            countIn.cancel();
+            this.isCountingIn = false;
+            this.seekDownBeat = null;
         },
 
         simpleSync(offset) {
@@ -992,6 +1239,7 @@ export default defineComponent({
                 return;
             }
 
+            this.isInitializingAudio = true;
             this.closeAllList();
 
             const audioPlayer = this.$refs.audioPlayer;
@@ -1028,7 +1276,8 @@ export default defineComponent({
 
                 let updateTimer = 0;
                 const onTimeUpdate = () => {
-                    this.api?.player?.output?.updatePosition(
+                    // Synth output lacks updatePosition during source switches
+                    this.api?.player?.output?.updatePosition?.(
                         audioPlayer.currentTime * 1000,
                     );
                 };
@@ -1047,6 +1296,12 @@ export default defineComponent({
                     // If the audio ended, the "pause" event will also be triggered
                     // Ignore this, because we have "ended" event to handle it
                     if (audioPlayer.ended) {
+                        return;
+                    }
+
+                    // Ignore the pause caused by restarting with a count-in,
+                    // otherwise it would cancel the pending count-in playback.
+                    if (this.isCountingIn) {
                         return;
                     }
 
@@ -1083,11 +1338,16 @@ export default defineComponent({
             this.api.updateSettings();
 
             let found = false;
+            let syncMethod = null;
+            let syncData = null;
 
-            // Get offset from youtubeList
+            // Get offset from audioList
             for (const audio of this.audioList) {
                 if (audio.filename === filename) {
                     this.audio = audio;
+                    syncMethod = audio.syncMethod;
+                    syncData = audio.syncMethod === "advanced" ? audio.advancedSync : audio.simpleSync;
+
                     if (audio.syncMethod === "advanced") {
                         this.advancedSync(audio.advancedSync);
                     } else {
@@ -1100,6 +1360,7 @@ export default defineComponent({
 
             // Probably provided an audio file not in the list, switch to synth
             if (!found) {
+                this.isInitializingAudio = false;
                 notify({
                     type: "error",
                     title: "Error",
@@ -1120,10 +1381,31 @@ export default defineComponent({
             audioPlayer.load();
             audioPlayer.playbackRate = this.api.playbackSpeed;
 
+            // Switching in an external audio element resets it to position 0,
+            // which drags the cursor to the first bar. If a playback range is
+            // highlighted, seek the cursor back to its start once the audio is
+            // actually loaded (earlier seeks are ignored by the element).
+            audioPlayer.addEventListener("loadeddata", () => this.seekToHighlightedRangeStart(), { once: true });
+            audioPlayer.addEventListener("canplay", () => this.seekToHighlightedRangeStart(), { once: true });
+            if (audioPlayer.readyState >= 1) {
+                this.seekToHighlightedRangeStart();
+            }
+
             this.pause();
+
+            // Re-apply sync points after pause() completes (pause triggers playing watcher which calls updateSettings)
+            await this.$nextTick();
+            if (syncMethod === "advanced") {
+                this.advancedSync(syncData);
+            } else {
+                this.simpleSync(syncData);
+            }
+
+            this.isInitializingAudio = false;
         },
 
         async initYoutube(videoID) {
+            this.isInitializingAudio = true;
             this.closeAllList();
 
             if (!this.youtubePlayer) {
@@ -1136,11 +1418,16 @@ export default defineComponent({
             this.api.updateSettings();
 
             let found = false;
+            let syncMethod = null;
+            let syncData = null;
 
             // Get offset from youtubeList
             for (const yt of this.youtubeList) {
                 if (yt.videoID === videoID) {
                     this.youtube = yt;
+                    syncMethod = yt.syncMethod;
+                    syncData = yt.syncMethod === "advanced" ? yt.advancedSync : yt.simpleSync;
+
                     if (yt.syncMethod === "advanced") {
                         this.advancedSync(yt.advancedSync);
                     } else {
@@ -1153,6 +1440,7 @@ export default defineComponent({
 
             // Probably provided a video ID not in the list, switch to synth
             if (!found) {
+                this.isInitializingAudio = false;
                 notify({
                     type: "error",
                     title: "Error",
@@ -1169,6 +1457,16 @@ export default defineComponent({
             this.youtubePlayer.cueVideoById(videoID);
             this.youtubePlayer.setPlaybackRate(this.api.playbackSpeed);
             this.pause();
+
+            // Re-apply sync points after pause() completes (pause triggers playing watcher which calls updateSettings)
+            await this.$nextTick();
+            if (syncMethod === "advanced") {
+                this.advancedSync(syncData);
+            } else {
+                this.simpleSync(syncData);
+            }
+
+            this.isInitializingAudio = false;
         },
 
         async initYoutubePlayer() {
@@ -1225,7 +1523,7 @@ export default defineComponent({
                         switch (e.data) {
                             case YT.PlayerState.PLAYING:
                                 currentTimeInterval = window.setInterval(() => {
-                                    this.api?.player?.output?.updatePosition(player.getCurrentTime() * 1000);
+                                    this.api?.player?.output?.updatePosition?.(player.getCurrentTime() * 1000);
                                 }, 50);
                                 this.playing = true;
                                 this.api?.play();
@@ -1237,6 +1535,11 @@ export default defineComponent({
                                 break;
                             case YT.PlayerState.PAUSED:
                                 window.clearInterval(currentTimeInterval);
+                                // Ignore the pause caused by restarting with a count-in,
+                                // otherwise it would cancel the pending count-in playback.
+                                if (this.isCountingIn) {
+                                    break;
+                                }
                                 this.playing = false;
                                 this.api?.pause();
                                 break;
@@ -1369,6 +1672,11 @@ export default defineComponent({
                 this.api.renderTracks([this.api.score.tracks[trackID]]);
                 this.setConfig("trackID", trackID);
             }
+
+            // A practice range is tied to the previous instrument's bars, so it
+            // must not carry over to the newly selected track.
+            this.api.playbackRange = null;
+            this.api.clearPlaybackRangeHighlight();
 
             this.closeAllList();
         },
@@ -1619,7 +1927,7 @@ export default defineComponent({
                     <font-awesome-icon :icon='["fas", "check"]' v-if="isLooping" />
                     Loop
                 </button>
-                <button class="btn btn-secondary" @click="countIn()" :class='{ active: enableCountIn, disabled: currentAudio !== "synth" }'>
+                <button class="btn btn-secondary" @click="countIn()" :class='{ active: enableCountIn }'>
                     <font-awesome-icon :icon='["fas", "check"]' v-if="enableCountIn" />
                     Count in
                 </button>

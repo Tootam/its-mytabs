@@ -13,6 +13,7 @@ export const SettingSchema = z.object({
     showKeySignature: z.boolean().default(false),
     scale: z.number().min(0.1).default(1),
     toolbarAutoHide: z.boolean().default(false),
+    preferredInstrument: z.enum(["none", "bass", "guitar"]).default("none"),
 });
 export type Setting = z.infer<typeof SettingSchema>;
 
@@ -124,6 +125,7 @@ export const LibraryBrowseVersionSchema = z.object({
     preferred: ApiBooleanSchema,
     hasAudio: ApiBooleanSchema,
     hasYoutube: ApiBooleanSchema,
+    lastAccessAt: z.string().optional(),
     createdAt: z.string(),
     updatedAt: z.string(),
 });

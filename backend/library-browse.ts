@@ -14,6 +14,7 @@ export interface LibraryBrowseVersion {
     preferred: boolean;
     hasAudio: boolean;
     hasYoutube: boolean;
+    lastAccessAt?: string;
     createdAt: string;
     updatedAt: string;
 }
@@ -80,6 +81,7 @@ export interface LibraryBrowseRow {
     fav: boolean;
     hasAudio: boolean;
     hasYoutube: boolean;
+    lastAccessAt?: string;
     createdAt: string;
     updatedAt: string;
 }
@@ -215,6 +217,7 @@ function toLibraryBrowseVersion(row: LibraryBrowseRow): LibraryBrowseVersion {
         preferred: row.preferredTabId === row.tabId,
         hasAudio: row.hasAudio,
         hasYoutube: row.hasYoutube,
+        lastAccessAt: row.lastAccessAt,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
     };

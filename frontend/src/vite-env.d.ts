@@ -1,5 +1,7 @@
 /// <reference types="vite/client" />
 
+import type { AlphaTabApi } from "@coderline/alphatab";
+
 /**
  * Global window properties injected by the backend
  */
@@ -12,5 +14,11 @@ declare global {
          */
         isDemo: boolean;
         defaultImportRoot?: string;
+
+        /**
+         * The alphaTab API instance exposed for debugging on the tab page.
+         * Set in Tab.vue (initContainer).
+         */
+        api: AlphaTabApi;
     }
 }

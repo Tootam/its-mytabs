@@ -427,7 +427,10 @@ export function getLibraryConfigJSON(id: string): ConfigJSON | null {
     }
     const legacyConfig = getLegacyTabConfig(id);
     if (legacyConfig) {
-        legacyConfig.tab = tab;
+        legacyConfig.tab = {
+            ...legacyConfig.tab,
+            ...tab,
+        };
         return legacyConfig;
     }
     return {
@@ -646,13 +649,13 @@ function mapLibraryBrowseRow(row: SqlRow): LibraryBrowseRow {
         ext: readNullableString(row, "ext"),
         public: readBoolean(row, "public"),
         fav: readBoolean(row, "fav"),
-        ...readLegacyMediaFlags(legacyConfigJson),
+        ...readLegacyMetadata(legacyConfigJson),
         createdAt: readString(row, "created_at"),
         updatedAt: readString(row, "updated_at"),
     };
 }
 
-function readLegacyMediaFlags(configJson: string | null): { hasAudio: boolean; hasYoutube: boolean } {
+function readLegacyMetadata(configJson: string | null): { hasAudio: boolean; hasYoutube: boolean; lastAccessAt?: string } {
     if (!configJson) {
         return { hasAudio: false, hasYoutube: false };
     }
@@ -661,6 +664,7 @@ function readLegacyMediaFlags(configJson: string | null): { hasAudio: boolean; h
         return {
             hasAudio: config.audio.length > 0,
             hasYoutube: config.youtube.length > 0,
+            lastAccessAt: config.tab.lastAccessAt,
         };
     } catch {
         return { hasAudio: false, hasYoutube: false };

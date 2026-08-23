@@ -27,6 +27,7 @@ const {
     replaceTab,
     updateTab,
     updateTabFav,
+    recordTabAccess,
     addAudio,
     removeAudio,
     updateAudio,
@@ -293,6 +294,26 @@ Deno.test("updateTabFav", async () => {
     assertEquals(getLibraryTabInfo(id)?.fav, false);
 });
 
+Deno.test("recordTabAccess", async () => {
+    const tabData = new Uint8Array([28, 29, 31]);
+    const id = await createTab(tabData, "gp", "Access Test", "Access Artist", "access.gp");
+
+    // No access recorded yet
+    let tab = await getTab(id);
+    assertEquals(tab.lastAccessAt, undefined);
+
+    // Record access, it persists in config.json
+    const timestamp = "2026-08-13T12:00:00.000Z";
+    await recordTabAccess(id, timestamp);
+
+    tab = await getTab(id);
+    assertEquals(tab.lastAccessAt, timestamp);
+
+    // And it survives a fresh read from disk
+    const config = await getConfigJSON(id);
+    assertEquals(config?.tab.lastAccessAt, timestamp);
+});
+
 Deno.test("addAudio", async () => {
     const tabData = new Uint8Array([31, 32, 33]);
     const id = await createTab(tabData, "gp", "Audio Test", "Audio Artist", "audio.gp");
@@ -413,7 +434,11 @@ Deno.test("updateAudio", async () => {
     // Try to update non-existent file, should throw
     await assertRejects(
         async () => {
-            await updateAudio(tab, "nonexistent.mp3", { syncMethod: "simple", simpleSync: 0, advancedSync: "" });
+            await updateAudio(tab, "nonexistent.mp3", {
+                syncMethod: "simple",
+                simpleSync: 0,
+                advancedSync: "",
+            });
         },
         Error,
         "Audio file not found",
@@ -422,7 +447,11 @@ Deno.test("updateAudio", async () => {
     // Test path traversal protection
     await assertRejects(
         async () => {
-            await updateAudio(tab, "../invalid.mp3", { syncMethod: "simple", simpleSync: 0, advancedSync: "" });
+            await updateAudio(tab, "../invalid.mp3", {
+                syncMethod: "simple",
+                simpleSync: 0,
+                advancedSync: "",
+            });
         },
         Error,
         "Invalid filename",

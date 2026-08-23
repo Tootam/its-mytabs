@@ -5,7 +5,7 @@ import { AudioData, AudioDataSchema, ConfigJSON, ConfigJSONSchema, SyncRequest, 
 import { kv, withTransaction } from "./db.ts";
 import sanitize from "sanitize-filename";
 import { supportedAudioFormatList, supportedFormatList } from "./common.ts";
-import { deleteLibraryTab, getLibraryTab, upsertArtist, upsertLegacyTabConfig, upsertLibraryTab, upsertSong, upsertTabFile, upsertTabFileSource } from "./library.ts";
+import { deleteLibraryTab, getLibraryConfigJSON, getLibraryTab, upsertArtist, upsertLegacyTabConfig, upsertLibraryTab, upsertSong, upsertTabFile, upsertTabFileSource } from "./library.ts";
 import { storeLibraryFile } from "./storage.ts";
 
 const updateQueues = new Map<string, Promise<ConfigJSON>>();
@@ -45,7 +45,9 @@ async function findTabFile(dirPath: string): Promise<string | null> {
     }
 
     for await (const entry of Deno.readDir(dirPath)) {
-        if (!entry.isFile) continue;
+        if (!entry.isFile) {
+            continue;
+        }
         const ext = path.extname(entry.name).slice(1).toLowerCase();
         if (supportedFormatList.includes(ext)) {
             return entry.name;
@@ -64,7 +66,9 @@ async function findAudioFiles(dirPath: string): Promise<string[]> {
     }
 
     for await (const entry of Deno.readDir(dirPath)) {
-        if (!entry.isFile) continue;
+        if (!entry.isFile) {
+            continue;
+        }
         const ext = path.extname(entry.name).slice(1).toLowerCase();
         if (supportedAudioFormatList.includes(ext)) {
             audioFiles.push(entry.name);
@@ -332,8 +336,15 @@ async function getNextID(): Promise<number> {
         const current = res.value || new Deno.KvU64(0n);
         const next = new Deno.KvU64(current.value + 1n);
         const commit = await kv.atomic()
-            .check({ key, versionstamp: res.versionstamp })
-            .mutate({ type: "set", key, value: next })
+            .check({
+                key,
+                versionstamp: res.versionstamp,
+            })
+            .mutate({
+                type: "set",
+                key,
+                value: next,
+            })
             .commit();
         if (commit.ok) {
             return Number(next.value);
@@ -359,6 +370,24 @@ export async function updateTabFav(tab: TabInfo, data: UpdateTabFav) {
     if (config) {
         await syncLibraryTabFromConfig(config);
     }
+}
+
+/** Record the last time a tab was opened so the home page can show recents. */
+export async function recordTabAccess(id: string, timestamp = new Date().toISOString()) {
+    const legacyConfig = await getConfigJSON(id, true);
+    if (legacyConfig) {
+        await updateConfigJSON(id, async (config) => {
+            config.tab.lastAccessAt = timestamp;
+        });
+        return;
+    }
+
+    const libraryConfig = getLibraryConfigJSON(id);
+    if (!libraryConfig) {
+        throw new Error("Tab not found");
+    }
+    libraryConfig.tab.lastAccessAt = timestamp;
+    upsertLegacyTabConfig(id, libraryConfig);
 }
 
 export function getTabFilePath(tab: TabInfo) {
@@ -508,7 +537,10 @@ export async function updateAudio(tab: TabInfo, filename: string, data: SyncRequ
     await updateConfigJSON(tab.id, async (config) => {
         // Find existing audio entry or create new one
         const existingIndex = config.audio.findIndex((a: AudioData) => a.filename === filename);
-        const audioData = AudioDataSchema.parse({ filename, ...data });
+        const audioData = AudioDataSchema.parse({
+            filename,
+            ...data,
+        });
 
         if (existingIndex >= 0) {
             config.audio[existingIndex] = audioData;
@@ -532,7 +564,10 @@ export async function addYoutube(id: string, videoID: string) {
 export async function updateYoutube(id: string, videoID: string, data: SyncRequest) {
     await updateConfigJSON(id, async (config) => {
         const existingIndex = config.youtube.findIndex((y: Youtube) => y.videoID === videoID);
-        const youtubeData = YoutubeSchema.parse({ videoID, ...data });
+        const youtubeData = YoutubeSchema.parse({
+            videoID,
+            ...data,
+        });
 
         if (existingIndex >= 0) {
             config.youtube[existingIndex] = youtubeData;
