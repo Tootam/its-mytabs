@@ -51,12 +51,38 @@ test.describe("toolbar playback controls", () => {
 
         await page.getByRole("button", { name: "Metronome" }).click();
         await expect(page.getByRole("button", { name: "Metronome" })).toHaveClass(/active/);
-        await expect.poll(() => page.evaluate(() => window.api.metronomeVolume)).toBe(1);
+        // The app consumes alphaTab's metronome timing events itself. Keeping
+        // the native click muted avoids its Web Audio stop/start race.
+        await expect.poll(() => page.evaluate(() => window.api.metronomeVolume)).toBe(0);
+        await expect.poll(() => page.evaluate(() => window.api.midiEventsPlayedFilter.length)).toBeGreaterThan(0);
 
         // Switching to an external audio source marks it disabled
         await page.click(".audio-selector .button");
         await page.locator(".audio-list .audio.item", { hasText: AUDIO_FILENAME }).click();
         await expect(page.getByRole("button", { name: "Metronome" })).toHaveClass(/disabled/);
+    });
+
+    test("metronome timing continues across loop boundaries", async ({ page, request }) => {
+        await waitForDemoTab(request);
+        await openTab(page, "synth");
+        await selectBars(page, 0, 0);
+
+        await page.evaluate(() => {
+            const state = { clicks: 0 };
+            (window as unknown as { metronomeTestState: typeof state }).metronomeTestState = state;
+            window.api.midiEventsPlayed.on((args) => {
+                state.clicks += args.events.filter((event) => event.isMetronome).length;
+            });
+        });
+
+        await page.getByRole("button", { name: "Loop" }).click();
+        await page.getByRole("button", { name: "Metronome" }).click();
+        await page.locator(".select-percentage input").fill("400");
+        await page.getByRole("button", { name: "Play" }).click();
+
+        // One 4/4 bar produces four events. More than eight proves the timing
+        // stream survived at least two loop boundaries.
+        await expect.poll(() => page.evaluate(() => (window as unknown as { metronomeTestState: { clicks: number } }).metronomeTestState.clicks)).toBeGreaterThanOrEqual(12);
     });
 
     test("speed input changes, clamps and persists", async ({ page, request }) => {
