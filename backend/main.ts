@@ -22,6 +22,7 @@ import {
     getTabFilePath,
     getTabFolderPath,
     getTabFullFilePath,
+    recordTabAccess,
     removeAudio,
     removeYoutube,
     replaceTab,
@@ -55,6 +56,7 @@ import {
 } from "./library.ts";
 import { resolveStoredPath } from "./storage.ts";
 import { migrateLegacyTabsToLibrary } from "./legacy-migration.ts";
+import { getSeparateJob, isModelInstalled, isOrtInstalled, isSeparateBusy, startMute, startSeparate } from "./separate.ts";
 
 let httpServer: ServerType;
 
@@ -94,7 +96,7 @@ export async function main() {
 
     // Inject demo mode flag using cheerio
     const $ = cheerio.load(indexHTMLContent);
-    $("head").append(`<script id="app-config" type="application/json">${JSON.stringify({ isDemo: isDemoMode })}</script>`);
+    $("head").append(`<script id="app-config" type="application/json">${JSON.stringify({ isDemo: isDemoMode, defaultImportRoot: getDefaultImportRoot() })}</script>`);
     const indexHTML = $.html();
 
     if (isDemoMode) {
@@ -235,7 +237,10 @@ export async function main() {
             const srcDir = getSourceDir();
             const rel = templateTypeList[type];
             if (!rel) {
-                return c.json({ ok: false, msg: "Template not found" }, 400);
+                return c.json({
+                    ok: false,
+                    msg: "Template not found",
+                }, 400);
             }
 
             const templatePath = path.join(srcDir, rel);
@@ -251,7 +256,10 @@ export async function main() {
                 config.tab.title += " #" + id;
             });
 
-            return c.json({ ok: true, id });
+            return c.json({
+                ok: true,
+                id,
+            });
         } catch (e) {
             return generalError(c, e);
         }
@@ -275,7 +283,7 @@ export async function main() {
 
     app.get("/api/library", async (c) => {
         try {
-            const loggedIn = await isLoggedIn(c);
+            await checkLogin(c);
             const query = LibraryBrowseQuerySchema.parse(c.req.query());
             return c.json({
                 ok: true,
@@ -283,8 +291,8 @@ export async function main() {
                     mode: query.mode,
                     search: query.search,
                     limit: query.limit,
-                    includePrivate: loggedIn,
-                    publicOnly: !loggedIn,
+                    offset: query.offset,
+                    includePrivate: true,
                 }),
             });
         } catch (e) {
@@ -319,6 +327,10 @@ export async function main() {
                 const storedPath = getLibraryTabStoredPath(id);
                 filePath = storedPath ? resolveStoredPath(storedPath) : getTabFullFilePath(config.tab);
             }
+
+            // Record the last time this tab was opened so the home page can show
+            // a "recent tabs" list.
+            await recordTabAccess(id);
 
             return c.json({
                 ok: true,
@@ -575,6 +587,94 @@ export async function main() {
         }
     });
 
+    // Separate Audio into Stems (bass / drums / guitar)
+    app.post("/api/tab/:id/audio/:filename/separate", async (c) => {
+        try {
+            await checkLogin(c);
+            const id = c.req.param("id");
+            const filename = c.req.param("filename");
+            checkFilename(filename);
+
+            const tab = await getTab(id);
+            const sourcePath = path.join(tabDir, id, filename);
+
+            if (!await fs.exists(sourcePath)) {
+                throw new Error("Audio file not found");
+            }
+
+            let downloadModel = false;
+            const body = await c.req.json().catch(() => ({}));
+            if (typeof body === "object" && body !== null) {
+                downloadModel = (body as { downloadModel?: unknown }).downloadModel === true;
+            }
+
+            startSeparate(tab.id, filename, sourcePath, downloadModel);
+
+            return c.json({
+                ok: true,
+            });
+        } catch (e) {
+            return generalError(c, e);
+        }
+    });
+
+    // Mute a stem in an audio file (produce a mix with bass / guitar removed)
+    app.post("/api/tab/:id/audio/:filename/mute", async (c) => {
+        try {
+            await checkLogin(c);
+            const id = c.req.param("id");
+            const filename = c.req.param("filename");
+            checkFilename(filename);
+
+            const tab = await getTab(id);
+            const sourcePath = path.join(tabDir, id, filename);
+
+            if (!await fs.exists(sourcePath)) {
+                throw new Error("Audio file not found");
+            }
+
+            const body = await c.req.json().catch(() => ({}));
+            const stem = typeof body === "object" && body !== null ? (body as { stem?: unknown }).stem : undefined;
+            if (stem !== "bass" && stem !== "drums" && stem !== "guitar") {
+                throw new Error("Invalid stem");
+            }
+            const downloadModel = typeof body === "object" && body !== null ? (body as { downloadModel?: unknown }).downloadModel === true : false;
+
+            // Avoid overwriting an existing file, e.g. a previous mute output.
+            const base = path.parse(filename).name;
+            let outputPath = path.join(tabDir, id, `${base}_muted-${stem}.ogg`);
+            while (await fs.exists(outputPath)) {
+                const parsed = path.parse(outputPath);
+                outputPath = path.join(parsed.dir, `new_${parsed.name}${parsed.ext}`);
+            }
+
+            startMute(tab.id, filename, sourcePath, stem, outputPath, downloadModel);
+
+            return c.json({
+                ok: true,
+            });
+        } catch (e) {
+            return generalError(c, e);
+        }
+    });
+
+    // Separate Audio Status (used by the UI to poll progress)
+    app.get("/api/separate/status", async (c) => {
+        try {
+            await checkLogin(c);
+            const job = getSeparateJob();
+            return c.json({
+                ok: true,
+                busy: isSeparateBusy(),
+                modelInstalled: isModelInstalled(),
+                ortInstalled: isOrtInstalled(),
+                job,
+            });
+        } catch (e) {
+            return generalError(c, e);
+        }
+    });
+
     // Serve audio file
     app.get("/api/tab/:id/audio/:filename", async (c) => {
         try {
@@ -594,10 +694,13 @@ export async function main() {
             }
 
             // serve the file
-            const file = await Deno.open(filePath, {
-                read: true,
-            });
+            const stat = await Deno.stat(filePath);
+            const size = stat.size;
+            const rangeHeader = c.req.header("range");
 
+            // HTML audio/video needs HTTP range support to seek (e.g. jumping
+            // the cursor to a highlighted bar), so serve partial content when
+            // a Range header is present.
             const encodedFilename = encodeURIComponent(filename);
             let mime = "application/octet-stream";
             let mimeList: Record<string, string> = {
@@ -610,9 +713,49 @@ export async function main() {
                 mime = mimeList[ext];
             }
 
-            return c.body(file.readable, 200, {
+            const baseHeaders = {
                 "Content-Type": mime,
+                "Accept-Ranges": "bytes",
                 "Content-Disposition": `attachment; filename="${encodedFilename}"`,
+            };
+
+            if (rangeHeader) {
+                const m = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
+                if (m) {
+                    let start = m[1] ? parseInt(m[1], 10) : 0;
+                    let end = m[2] ? parseInt(m[2], 10) : size - 1;
+                    if (isNaN(start)) {
+                        start = 0;
+                    }
+                    if (isNaN(end) || end >= size) {
+                        end = size - 1;
+                    }
+                    if (start > end || start >= size) {
+                        return c.body(null, 416, { "Content-Range": `bytes */${size}` });
+                    }
+                    // Read only the requested slice instead of the whole file
+                    const file = await Deno.open(filePath, { read: true });
+                    const length = end - start + 1;
+                    const buf = new Uint8Array(length);
+                    await file.seek(start, Deno.SeekMode.Start);
+                    const bytesRead = await file.read(buf);
+                    file.close();
+                    return c.body(bytesRead !== null ? buf.subarray(0, bytesRead) : buf, 206, {
+                        ...baseHeaders,
+                        "Content-Range": `bytes ${start}-${end}/${size}`,
+                        "Content-Length": String(length),
+                    });
+                }
+            }
+
+            // No Range header: serve the whole file
+            const file = await Deno.open(filePath, {
+                read: true,
+            });
+
+            return c.body(file.readable, 200, {
+                ...baseHeaders,
+                "Content-Length": String(size),
             });
         } catch (e) {
             return generalError(c, e);
@@ -756,7 +899,9 @@ export async function main() {
 
             const token = crypto.randomUUID();
 
-            await kv.set(["temp_token", token], tab.id, { expireIn: 20 });
+            // expireIn 20 seconds
+
+            await kv.set(["temp_token", token], tab.id, { expireIn: 20 * 1000 });
             return c.json({
                 ok: true,
                 token,
@@ -805,7 +950,11 @@ export async function main() {
                 throw new Error("Open folder is only supported on Windows");
             }
             const folder = getTabFolderPath(tab);
-            const child = new Deno.Command("explorer.exe", { args: [folder], stdout: "null", stderr: "null" }).spawn();
+            const child = new Deno.Command("explorer.exe", {
+                args: [folder],
+                stdout: "null",
+                stderr: "null",
+            }).spawn();
             await child.status;
             return c.json({ ok: true });
         } catch (e) {
@@ -824,7 +973,11 @@ export async function main() {
             }
 
             const fullPath = getTabFullFilePath(tab);
-            const child = new Deno.Command("cmd", { args: ["/c", "start", "", fullPath], stdout: "null", stderr: "null" }).spawn();
+            const child = new Deno.Command("cmd", {
+                args: ["/c", "start", "", fullPath],
+                stdout: "null",
+                stderr: "null",
+            }).spawn();
             await child.status;
             return c.json({ ok: true });
         } catch (e) {
@@ -919,6 +1072,10 @@ async function getTabInfoForAccess(id: string) {
         }
         throw error;
     }
+}
+
+function getDefaultImportRoot(): string {
+    return (Deno.env.get("MYTABS_IMPORT_ROOTS") ?? "").split(path.DELIMITER).map((root) => root.trim()).find(Boolean) ?? "";
 }
 
 function generalError(c: Context, e: unknown) {

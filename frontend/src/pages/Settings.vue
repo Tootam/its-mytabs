@@ -22,6 +22,7 @@ export default defineComponent({
                 scrollMode: "",
                 scale: 1,
                 toolbarAutoHide: false,
+                preferredInstrument: "none",
             },
             isProcessing: false,
         };
@@ -144,6 +145,16 @@ export default defineComponent({
             </select>
         </div>
 
+        <!-- Preferred Instrument -->
+        <div class="mb-3">
+            <label for="preferredInstrument" class="form-label">Preferred Instrument</label>
+            <select id="preferredInstrument" class="form-select" v-model="setting.preferredInstrument">
+                <option value="none">None</option>
+                <option value="bass">Bass</option>
+                <option value="guitar">Guitar</option>
+            </select>
+        </div>
+
         <!-- Tab/Score Display Scale -->
         <div class="mb-3">
             <label for="scale" class="form-label">Tab/Score Display Scale</label>
@@ -195,7 +206,7 @@ export default defineComponent({
 
         <!-- Note Color refer to SettingSchema   noteColor: z.enum(["rocksmith", "none"]).default("none"), -->
         <div class="mb-3">
-            <label for="noteColor" class="form-label">Note Color</label>
+            <label for="noteColor" class="form-label">Tab Number Color</label>
             <select id="noteColor" class="form-select" v-model="setting.noteColor">
                 <option value="none">No Color</option>
                 <option value="rocksmith">Rocksmith 2014 Color Scheme</option>
@@ -241,5 +252,4 @@ export default defineComponent({
     </div>
 </template>
 
-<style scoped lang="scss">
-</style>
+<style scoped lang="scss"></style>

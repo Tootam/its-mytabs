@@ -14,6 +14,7 @@ export interface LibraryBrowseVersion {
     preferred: boolean;
     hasAudio: boolean;
     hasYoutube: boolean;
+    lastAccessAt?: string;
     createdAt: string;
     updatedAt: string;
 }
@@ -51,6 +52,10 @@ export interface LibraryBrowseResult {
     artistCount: number;
     songCount: number;
     versionCount: number;
+    totalVersionCount: number;
+    offset: number;
+    limit: number | null;
+    hasMore: boolean;
     artists: LibraryBrowseArtist[];
 }
 
@@ -76,14 +81,18 @@ export interface LibraryBrowseRow {
     fav: boolean;
     hasAudio: boolean;
     hasYoutube: boolean;
+    lastAccessAt?: string;
     createdAt: string;
     updatedAt: string;
 }
 
-export function buildLibraryBrowse(rows: LibraryBrowseRow[], mode: "album" | "flat"): LibraryBrowseResult {
+export function buildLibraryBrowse(rows: LibraryBrowseRow[], mode: "album" | "flat", pagination?: { totalVersionCount?: number; offset?: number; limit?: number | null }): LibraryBrowseResult {
     const artists = buildLibraryBrowseArtists(rows, mode);
     const songIds = new Set<number>();
     let versionCount = 0;
+    const offset = pagination?.offset ?? 0;
+    const limit = pagination?.limit ?? null;
+    const totalVersionCount = pagination?.totalVersionCount ?? rows.length;
 
     for (const artist of artists) {
         versionCount += artist.versionCount;
@@ -102,6 +111,10 @@ export function buildLibraryBrowse(rows: LibraryBrowseRow[], mode: "album" | "fl
         artistCount: artists.length,
         songCount: songIds.size,
         versionCount,
+        totalVersionCount,
+        offset,
+        limit,
+        hasMore: offset + rows.length < totalVersionCount,
         artists,
     };
 }
@@ -204,6 +217,7 @@ function toLibraryBrowseVersion(row: LibraryBrowseRow): LibraryBrowseVersion {
         preferred: row.preferredTabId === row.tabId,
         hasAudio: row.hasAudio,
         hasYoutube: row.hasYoutube,
+        lastAccessAt: row.lastAccessAt,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
     };

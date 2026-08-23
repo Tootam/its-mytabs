@@ -13,6 +13,7 @@ export const SettingSchema = z.object({
     showKeySignature: z.boolean().default(false),
     scale: z.number().min(0.1).default(1),
     toolbarAutoHide: z.boolean().default(false),
+    preferredInstrument: z.enum(["none", "bass", "guitar"]).default("none"),
 });
 export type Setting = z.infer<typeof SettingSchema>;
 
@@ -125,6 +126,7 @@ export const LibraryBrowseVersionSchema = z.object({
     preferred: ApiBooleanSchema,
     hasAudio: ApiBooleanSchema,
     hasYoutube: ApiBooleanSchema,
+    lastAccessAt: z.string().optional(),
     createdAt: z.string(),
     updatedAt: z.string(),
 });
@@ -166,6 +168,10 @@ export const LibraryBrowseSchema = z.object({
     artistCount: z.number(),
     songCount: z.number(),
     versionCount: z.number(),
+    totalVersionCount: z.number(),
+    offset: z.number(),
+    limit: z.number().nullable(),
+    hasMore: ApiBooleanSchema,
     artists: z.array(LibraryBrowseArtistSchema),
 });
 export type LibraryBrowse = z.infer<typeof LibraryBrowseSchema>;

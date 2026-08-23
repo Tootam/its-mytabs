@@ -22,6 +22,9 @@ export const TabInfoSchema = z.object({
     createdAt: z.iso.datetime().default(() => new Date().toISOString()),
     public: isPublic.default(false),
     fav: isFav.default(false),
+    // When the tab was last opened (ISO date). Not required so existing
+    // config.json files parse fine.
+    lastAccessAt: z.iso.datetime().optional(),
 });
 export type TabInfo = z.infer<typeof TabInfoSchema>;
 
@@ -170,6 +173,7 @@ export const LibraryBrowseQuerySchema = z.object({
     mode: z.enum(["album", "flat"]).default("album"),
     search: QueryStringSchema,
     limit: z.coerce.number().int().min(1).max(1000).default(500),
+    offset: z.coerce.number().int().min(0).default(0),
 });
 export type LibraryBrowseQuery = z.infer<typeof LibraryBrowseQuerySchema>;
 

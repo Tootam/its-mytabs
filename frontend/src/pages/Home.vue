@@ -6,6 +6,8 @@ import { isLoggedIn } from "../auth-client.js";
 import TabItem from "../components/TabItem.vue";
 import { LibraryBrowseSchema } from "../zod.ts";
 
+const libraryPageSize = 500;
+
 export default defineComponent({
     components: {
         TabItem,
@@ -23,6 +25,8 @@ export default defineComponent({
             expandedSongs: {},
             searchRefreshTimer: null,
             libraryRequestId: 0,
+            isLoadingMore: false,
+            recentLimit: 20,
         };
     },
 
@@ -56,6 +60,14 @@ export default defineComponent({
 
         favoritedTabs() {
             return this.tabList.filter((tab) => tab.fav);
+        },
+
+        // Tabs the user opened most recently (tracked via lastAccessAt in KV).
+        recentTabs() {
+            const opened = this.tabList
+                .filter((tab) => tab.lastAccessAt)
+                .sort((a, b) => new Date(b.lastAccessAt).getTime() - new Date(a.lastAccessAt).getTime());
+            return opened.slice(0, this.recentLimit);
         },
 
         groupedTabs() {
@@ -94,6 +106,18 @@ export default defineComponent({
 
         useLibraryGrouping() {
             return this.setting.groupByArtist && this.filteredLibrary && this.filteredLibrary.artists.length > 0;
+        },
+
+        loadedVersionCount() {
+            return this.tabList.length;
+        },
+
+        totalVersionCount() {
+            return this.library?.totalVersionCount ?? this.tabList.length;
+        },
+
+        hasMoreLibraryTabs() {
+            return !!this.library?.hasMore;
         },
     },
 
@@ -204,10 +228,13 @@ export default defineComponent({
             }
         },
 
-        async refreshLibrary() {
+        async refreshLibrary(options = {}) {
+            const append = options.append === true;
+            const offset = append ? this.tabList.length : 0;
             const params = new URLSearchParams({
                 mode: "album",
-                limit: "1000",
+                limit: String(libraryPageSize),
+                offset: String(offset),
             });
             if (this.searchQuery.trim()) {
                 params.set("search", this.searchQuery.trim());
@@ -218,8 +245,84 @@ export default defineComponent({
             if (requestId !== this.libraryRequestId) {
                 return;
             }
-            this.library = LibraryBrowseSchema.parse(libraryData.library);
-            this.tabList = this.flattenLibraryTabs(this.library);
+            const page = LibraryBrowseSchema.parse(libraryData.library);
+            this.library = append && this.library ? this.mergeLibraryPages(this.library, page) : page;
+            this.tabList = append ? [...this.tabList, ...this.flattenLibraryTabs(page)] : this.flattenLibraryTabs(page);
+        },
+
+        async loadMoreLibraryTabs() {
+            if (this.isLoadingMore || !this.hasMoreLibraryTabs) {
+                return;
+            }
+            this.isLoadingMore = true;
+            try {
+                await this.refreshLibrary({ append: true });
+            } catch (error) {
+                notify({
+                    text: error.message,
+                    type: "error",
+                });
+            } finally {
+                this.isLoadingMore = false;
+            }
+        },
+
+        mergeLibraryPages(current, page) {
+            const merged = {
+                ...current,
+                artistCount: current.artistCount + page.artistCount,
+                songCount: current.songCount + page.songCount,
+                versionCount: current.versionCount + page.versionCount,
+                totalVersionCount: page.totalVersionCount,
+                hasMore: page.hasMore,
+                limit: page.limit,
+                artists: current.artists.map((artist) => ({
+                    ...artist,
+                    albums: artist.albums.map((album) => ({ ...album, songs: album.songs.map((song) => ({ ...song, versions: [...song.versions] })) })),
+                    songs: artist.songs.map((song) => ({ ...song, versions: [...song.versions] })),
+                })),
+            };
+
+            for (const pageArtist of page.artists) {
+                const artist = merged.artists.find((candidate) => candidate.id === pageArtist.id);
+                if (!artist) {
+                    merged.artists.push(pageArtist);
+                    continue;
+                }
+                artist.songCount += pageArtist.songCount;
+                artist.versionCount += pageArtist.versionCount;
+                this.mergeAlbumLists(artist.albums, pageArtist.albums);
+                this.mergeSongLists(artist.songs, pageArtist.songs);
+            }
+            return merged;
+        },
+
+        mergeAlbumLists(currentAlbums, pageAlbums) {
+            for (const pageAlbum of pageAlbums) {
+                const album = currentAlbums.find((candidate) => candidate.id === pageAlbum.id);
+                if (!album) {
+                    currentAlbums.push(pageAlbum);
+                    continue;
+                }
+                album.songCount += pageAlbum.songCount;
+                album.versionCount += pageAlbum.versionCount;
+                this.mergeSongLists(album.songs, pageAlbum.songs);
+            }
+        },
+
+        mergeSongLists(currentSongs, pageSongs) {
+            for (const pageSong of pageSongs) {
+                const song = currentSongs.find((candidate) => candidate.id === pageSong.id);
+                if (!song) {
+                    currentSongs.push(pageSong);
+                    continue;
+                }
+                song.versions.push(...pageSong.versions);
+                song.versionCount = song.versions.length;
+                song.publicVersionCount += pageSong.publicVersionCount;
+                song.favVersionCount += pageSong.favVersionCount;
+                song.preferredVersion = song.versions.find((version) => version.preferred) || song.preferredVersion || pageSong.preferredVersion;
+            }
         },
 
         flattenLibraryTabs(library) {
@@ -235,6 +338,7 @@ export default defineComponent({
                         createdAt: version.createdAt,
                         public: version.public,
                         fav: version.fav,
+                        lastAccessAt: version.lastAccessAt,
                     });
                 }
             };
@@ -252,156 +356,198 @@ export default defineComponent({
 </script>
 
 <template>
-    <div class="container my-container">
-        <!-- Favorites Section -->
-        <div class="favorites-section" v-if="ready && favoritedTabs.length > 0">
-            <TabItem
-                v-for="tab in favoritedTabs"
-                :key="`fav-${tab.id}`"
-                :tab="tab"
-                :show-artist="true"
-                @delete="deleteTab"
-                @favToggled="handleFavToggled"
-            />
-        </div>
+    <div class="container-fluid home-container">
+        <div class="row" v-if="ready">
+            <div class="col-md-12 col-lg-8 order-2 order-lg-1 home-col-tablist">
+                <div class="search-section mb-3 pe-3 ps-3">
+                    <div class="input-group">
+                        <span class="input-group-text">
+                            <font-awesome-icon icon="magnifying-glass" />
+                        </span>
 
-        <div class="search-section mb-3 mt-4 pe-3 ps-3" v-if="ready">
-            <div class="input-group">
-                <span class="input-group-text">
-                    <font-awesome-icon icon="magnifying-glass" />
-                </span>
+                        <input
+                            type="text"
+                            class="form-control search-input"
+                            v-model="searchQuery"
+                            placeholder="Search by title or artist..."
+                            ref="searchInput"
+                            aria-label="Search tabs"
+                        />
 
-                <input
-                    type="text"
-                    class="form-control search-input"
-                    v-model="searchQuery"
-                    placeholder="Search by title or artist..."
-                    ref="searchInput"
-                    aria-label="Search tabs"
-                />
+                        <button
+                            class="input-group-text bg-transparent border-0 cursor-pointer"
+                            type="button"
+                            @click='searchQuery = ""'
+                            v-if="searchQuery"
+                            aria-label="Clear search"
+                        >
+                            ✕
+                        </button>
+                    </div>
+                </div>
 
-                <button
-                    class="input-group-text bg-transparent border-0 cursor-pointer"
-                    type="button"
-                    @click='searchQuery = ""'
-                    v-if="searchQuery"
-                    aria-label="Clear search"
+                <div class="mb-4 ms-3">
+                    Tabs: {{ loadedVersionCount }} of {{ totalVersionCount }}
+                </div>
+
+                <template v-if="useLibraryGrouping">
+                    <div v-for="artist in filteredLibrary.artists" :key="artist.id" class="library-artist mb-4 ms-3 me-3">
+                        <h4>{{ artist.name }}</h4>
+
+                        <div v-for="album in artist.albums" :key="album.id" class="library-album mb-3">
+                            <h4 class="album-title">
+                                <button class="album-title-button" type="button" @click="toggleAlbum(album)" :aria-expanded="isAlbumExpanded(album)">
+                                    <font-awesome-icon :icon='isAlbumExpanded(album) ? "chevron-down" : "chevron-right"' />
+                                    <span>{{ album.title }}</span>
+                                </button>
+                            </h4>
+
+                            <div v-for="song in album.songs" v-show="isAlbumExpanded(album)" :key="song.id" class="library-song">
+                                <div class="song-row" :class="{ 'song-row-single': song.versionCount <= 1 }">
+                                    <button
+                                        v-if="song.versionCount > 1"
+                                        class="expand-btn"
+                                        type="button"
+                                        @click="toggleSong(song)"
+                                        :aria-label="isSongExpanded(song) ? 'Collapse versions' : 'Expand versions'"
+                                    >
+                                        <font-awesome-icon :icon='isSongExpanded(song) ? "chevron-down" : "chevron-right"' />
+                                    </button>
+
+                                    <router-link class="song-main" :to="`/tab/${primaryVersion(song).id}`">
+                                        <span class="song-title">{{ song.title }}</span>
+                                        <span v-if="song.versionCount > 1" class="song-meta">{{ song.versionCount }} versions</span>
+                                    </router-link>
+                                </div>
+
+                                <div class="version-list" v-if="song.versionCount > 1 && isSongExpanded(song)">
+                                    <router-link v-for="version in song.versions" :key="version.id" class="version-row" :to="`/tab/${version.id}`">
+                                        <span class="version-name">
+                                            {{ versionTitle(version) }}
+                                            <font-awesome-icon v-if="version.preferred" icon="check" class="preferred-icon" />
+                                            <font-awesome-icon v-if="version.fav" icon="star" class="fav-icon" />
+                                        </span>
+                                        <span class="version-meta">{{ versionMeta(version) }}</span>
+                                    </router-link>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div v-for="song in artist.songs" :key="song.id" class="library-song">
+                            <div class="song-row" :class="{ 'song-row-single': song.versionCount <= 1 }">
+                                <button
+                                    v-if="song.versionCount > 1"
+                                    class="expand-btn"
+                                    type="button"
+                                    @click="toggleSong(song)"
+                                    :aria-label="isSongExpanded(song) ? 'Collapse versions' : 'Expand versions'"
+                                >
+                                    <font-awesome-icon :icon='isSongExpanded(song) ? "chevron-down" : "chevron-right"' />
+                                </button>
+
+                                <router-link class="song-main" :to="`/tab/${primaryVersion(song).id}`">
+                                    <span class="song-title">{{ song.title }}</span>
+                                    <span v-if="song.versionCount > 1" class="song-meta">{{ song.versionCount }} versions</span>
+                                </router-link>
+                            </div>
+
+                            <div class="version-list" v-if="song.versionCount > 1 && isSongExpanded(song)">
+                                <router-link v-for="version in song.versions" :key="version.id" class="version-row" :to="`/tab/${version.id}`">
+                                    <span class="version-name">
+                                        {{ versionTitle(version) }}
+                                        <font-awesome-icon v-if="version.preferred" icon="check" class="preferred-icon" />
+                                        <font-awesome-icon v-if="version.fav" icon="star" class="fav-icon" />
+                                    </span>
+                                    <span class="version-meta">{{ versionMeta(version) }}</span>
+                                </router-link>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+
+                <template v-else-if="this.setting.groupByArtist && groupedTabs">
+                    <div v-for="group in groupedTabs" :key="group.displayName" class="mb-4 ms-3">
+                        <h4>{{ group.displayName }}</h4>
+
+                        <TabItem
+                            v-for="tab in group.tabs"
+                            :key="tab.id"
+                            :tab="tab"
+                            :show-artist="false"
+                            @delete="deleteTab"
+                            @favToggled="handleFavToggled"
+                        />
+                    </div>
+                </template>
+
+                <template v-else>
+                    <TabItem
+                        v-for="tab in filteredTabList"
+                        :key="tab.id"
+                        :tab="tab"
+                        :show-artist="true"
+                        @delete="deleteTab"
+                        @favToggled="handleFavToggled"
+                    />
+                </template>
+
+                <div v-if="hasMoreLibraryTabs" class="load-more-section text-center my-4">
+                    <button class="btn btn-outline-secondary" type="button" :disabled="isLoadingMore" @click="loadMoreLibraryTabs">
+                        {{ isLoadingMore ? "Loading..." : "Load more" }}
+                    </button>
+                </div>
+
+                <div
+                    v-if="filteredTabList.length === 0 && searchQuery"
+                    class="empty-state text-center py-5 mb-4 fs-5"
                 >
-                    ✕
-                </button>
-            </div>
-        </div>
+                    <p class="text-muted">No tabs found for "{{ searchQuery }}"</p>
 
-        <div class="mb-4 ms-3" v-if="ready">
-            <template v-if="useLibraryGrouping">
-                Total Songs: {{ filteredLibrary.songCount }} / Versions: {{ filteredLibrary.versionCount }}
-            </template>
-            <template v-else>
-                Total Tabs: {{ filteredTabList.length }}
-                <span v-if="searchQuery" class="text-muted">
-                    (of {{ tabList.length }})
-                </span>
-            </template>
-        </div>
-
-        <template v-if="useLibraryGrouping">
-            <div v-for="artist in filteredLibrary.artists" :key="artist.id" class="library-artist mb-4 ms-3 me-3">
-                <h4>{{ artist.name }}</h4>
-
-                <div v-for="album in artist.albums" :key="album.id" class="library-album mb-3">
-                    <h4 class="album-title">
-                        <button class="album-title-button" type="button" @click="toggleAlbum(album)" :aria-expanded="isAlbumExpanded(album)">
-                            <font-awesome-icon :icon='isAlbumExpanded(album) ? "chevron-down" : "chevron-right"' />
-                            <span>{{ album.title }}</span>
-                        </button>
-                    </h4>
-
-                    <div v-for="song in album.songs" v-show="isAlbumExpanded(album)" :key="song.id" class="library-song">
-                        <div class="song-row" :class="{ 'song-row-single': song.versionCount <= 1 }">
-                            <button v-if="song.versionCount > 1" class="expand-btn" type="button" @click="toggleSong(song)" :aria-label="isSongExpanded(song) ? 'Collapse versions' : 'Expand versions'">
-                                <font-awesome-icon :icon='isSongExpanded(song) ? "chevron-down" : "chevron-right"' />
-                            </button>
-
-                            <router-link class="song-main" :to="`/tab/${primaryVersion(song).id}`">
-                                <span class="song-title">{{ song.title }}</span>
-                                <span v-if="song.versionCount > 1" class="song-meta">{{ song.versionCount }} versions</span>
-                            </router-link>
-                        </div>
-
-                        <div class="version-list" v-if="song.versionCount > 1 && isSongExpanded(song)">
-                            <router-link v-for="version in song.versions" :key="version.id" class="version-row" :to="`/tab/${version.id}`">
-                                <span class="version-name">
-                                    {{ versionTitle(version) }}
-                                    <font-awesome-icon v-if="version.preferred" icon="check" class="preferred-icon" />
-                                    <font-awesome-icon v-if="version.fav" icon="star" class="fav-icon" />
-                                </span>
-                                <span class="version-meta">{{ versionMeta(version) }}</span>
-                            </router-link>
-                        </div>
-                    </div>
-                </div>
-
-                <div v-for="song in artist.songs" :key="song.id" class="library-song">
-                    <div class="song-row" :class="{ 'song-row-single': song.versionCount <= 1 }">
-                        <button v-if="song.versionCount > 1" class="expand-btn" type="button" @click="toggleSong(song)" :aria-label="isSongExpanded(song) ? 'Collapse versions' : 'Expand versions'">
-                            <font-awesome-icon :icon='isSongExpanded(song) ? "chevron-down" : "chevron-right"' />
-                        </button>
-
-                        <router-link class="song-main" :to="`/tab/${primaryVersion(song).id}`">
-                            <span class="song-title">{{ song.title }}</span>
-                            <span v-if="song.versionCount > 1" class="song-meta">{{ song.versionCount }} versions</span>
-                        </router-link>
-                    </div>
-
-                    <div class="version-list" v-if="song.versionCount > 1 && isSongExpanded(song)">
-                        <router-link v-for="version in song.versions" :key="version.id" class="version-row" :to="`/tab/${version.id}`">
-                            <span class="version-name">
-                                {{ versionTitle(version) }}
-                                <font-awesome-icon v-if="version.preferred" icon="check" class="preferred-icon" />
-                                <font-awesome-icon v-if="version.fav" icon="star" class="fav-icon" />
-                            </span>
-                            <span class="version-meta">{{ versionMeta(version) }}</span>
-                        </router-link>
-                    </div>
+                    <button class="btn btn-sm btn-outline-secondary" @click='searchQuery = ""'>
+                        Clear search
+                    </button>
                 </div>
             </div>
-        </template>
 
-        <template v-else-if="this.setting.groupByArtist && groupedTabs">
-            <div v-for="group in groupedTabs" :key="group.displayName" class="mb-4 ms-3">
-                <h4>{{ group.displayName }}</h4>
+            <div class="col-md-12 col-lg-4 order-1 order-lg-2 home-sidebar">
+                <div class="box box-top">
+                    <div class="ms-3 mb-2">
+                        <h4>Recent Tabs</h4>
+                    </div>
 
-                <TabItem
-                    v-for="tab in group.tabs"
-                    :key="tab.id"
-                    :tab="tab"
-                    :show-artist="false"
-                    @delete="deleteTab"
-                    @favToggled="handleFavToggled"
-                />
+                    <div v-if="recentTabs.length === 0" class="empty-msg">
+                        No Recent Tabs
+                    </div>
+
+                    <TabItem
+                        v-for="tab in recentTabs"
+                        :key="`recent-${tab.id}`"
+                        :tab="tab"
+                        :show-artist="true"
+                        @delete="deleteTab"
+                        @favToggled="handleFavToggled"
+                    />
+                </div>
+
+                <div class="box box-bottom">
+                    <div class="ms-3 mb-2">
+                        <h4>Favorite Tabs</h4>
+                    </div>
+
+                    <div v-if="favoritedTabs.length === 0" class="empty-msg">
+                        No Favorite Tabs
+                    </div>
+
+                    <TabItem
+                        v-for="tab in favoritedTabs"
+                        :key="`fav-${tab.id}`"
+                        :tab="tab"
+                        :show-artist="true"
+                        @delete="deleteTab"
+                        @favToggled="handleFavToggled"
+                    />
+                </div>
             </div>
-        </template>
-
-        <template v-else>
-            <TabItem
-                v-for="tab in filteredTabList"
-                :key="tab.id"
-                :tab="tab"
-                :show-artist="true"
-                @delete="deleteTab"
-                @favToggled="handleFavToggled"
-            />
-        </template>
-
-        <div
-            v-if="ready && filteredTabList.length === 0 && searchQuery"
-            class="empty-state text-center py-5 mb-4 fs-5"
-        >
-            <p class="text-muted">No tabs found for "{{ searchQuery }}"</p>
-
-            <button class="btn btn-sm btn-outline-secondary" @click='searchQuery = ""'>
-                Clear search
-            </button>
         </div>
     </div>
 </template>
@@ -526,5 +672,42 @@ h4 {
 .fav-icon {
     color: #ffa500;
     margin-left: 6px;
+}
+
+.box {
+    background-color: rgba(0, 0, 0, 0.16);
+    padding: 25px;
+
+    &.box-top {
+        border-radius: 25px 25px 0 0;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    }
+
+    &.box-bottom {
+        border-radius: 0 0 25px 25px;
+    }
+}
+
+.desktop .home-sidebar {
+    position: sticky;
+    top: 20px;
+    align-self: flex-start;
+    max-height: calc(100vh - 160px);
+    overflow-y: auto;
+}
+
+.mobile .home-sidebar {
+    margin-bottom: 25px;
+}
+
+.empty-msg {
+    text-align: center;
+    color: $color2-dark;
+    font-size: 1.1rem;
+    margin-top: 20px;
+}
+
+.desktop .home-container {
+    padding-right: 26px;
 }
 </style>

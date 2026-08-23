@@ -2,9 +2,22 @@ import { checkAudioFormat, checkFilename, flacToOgg, tabDir } from "./util.ts";
 import * as fs from "@std/fs";
 import * as path from "@std/path";
 import { AudioData, AudioDataSchema, ConfigJSON, ConfigJSONSchema, SyncRequest, TabInfo, TabInfoSchema, UpdateTabFav, UpdateTabInfo, Youtube, YoutubeSchema } from "./zod.ts";
-import { kv } from "./db.ts";
+import { kv, withTransaction } from "./db.ts";
 import sanitize from "sanitize-filename";
 import { supportedAudioFormatList, supportedFormatList } from "./common.ts";
+import {
+    deleteLibraryTab,
+    getLibraryConfigJSON,
+    getLibraryTab,
+    upsertAlbum,
+    upsertArtist,
+    upsertLegacyTabConfig,
+    upsertLibraryTab,
+    upsertSong,
+    upsertTabFile,
+    upsertTabFileSource,
+} from "./library.ts";
+import { storeLibraryFile } from "./storage.ts";
 
 const updateQueues = new Map<string, Promise<ConfigJSON>>();
 
@@ -43,7 +56,9 @@ async function findTabFile(dirPath: string): Promise<string | null> {
     }
 
     for await (const entry of Deno.readDir(dirPath)) {
-        if (!entry.isFile) continue;
+        if (!entry.isFile) {
+            continue;
+        }
         const ext = path.extname(entry.name).slice(1).toLowerCase();
         if (supportedFormatList.includes(ext)) {
             return entry.name;
@@ -62,7 +77,9 @@ async function findAudioFiles(dirPath: string): Promise<string[]> {
     }
 
     for await (const entry of Deno.readDir(dirPath)) {
-        if (!entry.isFile) continue;
+        if (!entry.isFile) {
+            continue;
+        }
         const ext = path.extname(entry.name).slice(1).toLowerCase();
         if (supportedAudioFormatList.includes(ext)) {
             audioFiles.push(entry.name);
@@ -171,6 +188,7 @@ export async function createTab(tabFileData: Uint8Array, ext: string, title: str
     };
 
     await writeConfigJSON(id.toString(), info);
+    await syncLibraryTabFromConfig(info, tabFileData, "new-tab", path.resolve(path.join(dir, filename)));
 
     return id.toString();
 }
@@ -236,6 +254,7 @@ export async function getOrCreateTab(id: string): Promise<TabInfo | null> {
     };
 
     await writeConfigJSON(id, newConfig);
+    await syncLibraryTabFromConfig(newConfig, undefined, "legacy-tab", path.resolve(path.join(dirPath, tabFile)));
     return tab;
 }
 
@@ -279,6 +298,10 @@ export async function replaceTab(tab: TabInfo, tabFileData: Uint8Array, ext: str
     tab.filename = filename;
     tab.originalFilename = originalFilename;
     await writeTabInfo(tab);
+    const config = await getConfigJSON(tab.id, true);
+    if (config) {
+        await syncLibraryTabFromConfig(config, tabFileData, "replace-tab", path.resolve(newFilePath));
+    }
 }
 
 async function getBackupTabFilePath(filePath: string): Promise<string> {
@@ -324,8 +347,15 @@ async function getNextID(): Promise<number> {
         const current = res.value || new Deno.KvU64(0n);
         const next = new Deno.KvU64(current.value + 1n);
         const commit = await kv.atomic()
-            .check({ key, versionstamp: res.versionstamp })
-            .mutate({ type: "set", key, value: next })
+            .check({
+                key,
+                versionstamp: res.versionstamp,
+            })
+            .mutate({
+                type: "set",
+                key,
+                value: next,
+            })
             .commit();
         if (commit.ok) {
             return Number(next.value);
@@ -339,11 +369,37 @@ export async function updateTab(tab: TabInfo, data: UpdateTabInfo) {
     tab.album = data.album;
     tab.public = data.public;
     await writeTabInfo(tab);
+    const config = await getConfigJSON(tab.id, true);
+    if (config) {
+        await syncLibraryTabFromConfig(config);
+    }
 }
 
 export async function updateTabFav(tab: TabInfo, data: UpdateTabFav) {
     tab.fav = data.fav;
     await writeTabInfo(tab);
+    const config = await getConfigJSON(tab.id, true);
+    if (config) {
+        await syncLibraryTabFromConfig(config);
+    }
+}
+
+/** Record the last time a tab was opened so the home page can show recents. */
+export async function recordTabAccess(id: string, timestamp = new Date().toISOString()) {
+    const legacyConfig = await getConfigJSON(id, true);
+    if (legacyConfig) {
+        await updateConfigJSON(id, async (config) => {
+            config.tab.lastAccessAt = timestamp;
+        });
+        return;
+    }
+
+    const libraryConfig = getLibraryConfigJSON(id);
+    if (!libraryConfig) {
+        throw new Error("Tab not found");
+    }
+    libraryConfig.tab.lastAccessAt = timestamp;
+    upsertLegacyTabConfig(id, libraryConfig);
 }
 
 export function getTabFilePath(tab: TabInfo) {
@@ -371,6 +427,9 @@ export async function deleteTab(id: string) {
     const newPath = path.join(tabDir, "deleted", id + "-" + Date.now().toString());
     await fs.ensureDir(path.join(tabDir, "deleted"));
     await Deno.rename(oldPath, newPath);
+    if (getLibraryTab(id)) {
+        deleteLibraryTab(id);
+    }
 }
 
 export async function addAudio(tab: TabInfo, audioFileData: Uint8Array, originalFilename: string) {
@@ -427,10 +486,55 @@ export async function updateConfigJSON(id: string, callback: (config: ConfigJSON
         }
         await callback(config);
         await writeConfigJSON(id, config);
+        if (getLibraryTab(config.tab.id)) {
+            await syncLibraryTabFromConfig(config);
+        }
         return config;
     });
     updateQueues.set(id, newQueue);
     return newQueue;
+}
+
+async function syncLibraryTabFromConfig(config: ConfigJSON, tabFileData?: Uint8Array, sourceType = "legacy-tab", sourcePath?: string): Promise<void> {
+    const tab = config.tab;
+    const ext = path.extname(tab.filename).slice(1).toLowerCase() || "gp";
+    const existing = getLibraryTab(tab.id);
+
+    let tabFileId = existing?.tabFileId ?? null;
+    if (tabFileData) {
+        const stored = await storeLibraryFile(tabFileData, ext);
+        const tabFile = upsertTabFile(stored);
+        tabFileId = tabFile.id;
+        upsertTabFileSource({
+            tabFileId,
+            sourceType,
+            sourcePath: sourcePath ?? getTabFullFilePath(tab),
+            originalFilename: tab.originalFilename,
+            metadata: {
+                legacyTabId: tab.id,
+                legacyFilename: tab.filename,
+            },
+        });
+    }
+
+    withTransaction(() => {
+        const artist = upsertArtist(tab.artist || "Unknown Artist");
+        const album = tab.album ? upsertAlbum(artist.id, tab.album) : null;
+        const song = upsertSong(artist.id, tab.title || tab.id, album?.id ?? null);
+        const libraryTab = upsertLibraryTab({
+            id: tab.id,
+            songId: song.id,
+            tabFileId,
+            title: tab.title,
+            artist: tab.artist,
+            filename: tab.filename,
+            originalFilename: tab.originalFilename,
+            public: tab.public,
+            fav: tab.fav,
+            createdAt: tab.createdAt,
+        });
+        upsertLegacyTabConfig(libraryTab.id, config);
+    });
 }
 
 export async function updateAudio(tab: TabInfo, filename: string, data: SyncRequest) {
@@ -446,7 +550,10 @@ export async function updateAudio(tab: TabInfo, filename: string, data: SyncRequ
     await updateConfigJSON(tab.id, async (config) => {
         // Find existing audio entry or create new one
         const existingIndex = config.audio.findIndex((a: AudioData) => a.filename === filename);
-        const audioData = AudioDataSchema.parse({ filename, ...data });
+        const audioData = AudioDataSchema.parse({
+            filename,
+            ...data,
+        });
 
         if (existingIndex >= 0) {
             config.audio[existingIndex] = audioData;
@@ -470,7 +577,10 @@ export async function addYoutube(id: string, videoID: string) {
 export async function updateYoutube(id: string, videoID: string, data: SyncRequest) {
     await updateConfigJSON(id, async (config) => {
         const existingIndex = config.youtube.findIndex((y: Youtube) => y.videoID === videoID);
-        const youtubeData = YoutubeSchema.parse({ videoID, ...data });
+        const youtubeData = YoutubeSchema.parse({
+            videoID,
+            ...data,
+        });
 
         if (existingIndex >= 0) {
             config.youtube[existingIndex] = youtubeData;
