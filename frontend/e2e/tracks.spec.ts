@@ -69,16 +69,48 @@ test.describe("track controls", () => {
         await expect(muteButtons.nth(0)).not.toHaveClass(/active/);
     });
 
-    test("track volume input is accepted", async ({ page, request }) => {
+    test("master volume sets every track and a track can be overridden", async ({ page, request }) => {
         await waitForDemoTab(request);
         await openTab(page, "synth");
 
-        await page.click(".track-selector .button");
-        const volumeInput = page.locator(".track-list .track .select-percentage input").nth(0);
+        await page.evaluate(() => {
+            const calls: Array<{ trackIndexes: number[]; volume: number }> = [];
+            const original = window.api.changeTrackVolume.bind(window.api);
+            window.api.changeTrackVolume = (tracks, volume) => {
+                calls.push({ trackIndexes: tracks.map((track) => track.index), volume });
+                original(tracks, volume);
+            };
+            (window as typeof window & { trackVolumeCalls: typeof calls }).trackVolumeCalls = calls;
+        });
 
-        await volumeInput.fill("60");
-        await volumeInput.press("Tab");
-        await expect(volumeInput).toHaveValue("60");
+        await page.click(".track-selector .button");
+        const masterVolumeInput = page.locator(".track-list .master-volume input");
+        const trackVolumeInputs = page.locator(".track-list .track .select-percentage input");
+
+        await masterVolumeInput.fill("44");
+        await expect(masterVolumeInput).toHaveValue("44");
+        for (let i = 0; i < 4; i++) {
+            await expect(trackVolumeInputs.nth(i)).toHaveValue("44");
+        }
+
+        await trackVolumeInputs.nth(0).fill("80");
+        await expect(trackVolumeInputs.nth(0)).toHaveValue("80");
+        for (let i = 1; i < 4; i++) {
+            await expect(trackVolumeInputs.nth(i)).toHaveValue("44");
+        }
+
+        const calls = await page.evaluate(() => (window as typeof window & { trackVolumeCalls: Array<{ trackIndexes: number[]; volume: number }> }).trackVolumeCalls);
+        expect(calls.at(-2)).toEqual({ trackIndexes: [0, 1, 2, 3], volume: 0.44 });
+        expect(calls.at(-1)).toEqual({ trackIndexes: [0], volume: 0.8 });
+
+        await openTab(page, "synth");
+        await page.click(".track-selector .button");
+        await expect(page.locator(".track-list .master-volume input")).toHaveValue("44");
+        const restoredTrackVolumeInputs = page.locator(".track-list .track .select-percentage input");
+        await expect(restoredTrackVolumeInputs.nth(0)).toHaveValue("80");
+        for (let i = 1; i < 4; i++) {
+            await expect(restoredTrackVolumeInputs.nth(i)).toHaveValue("44");
+        }
     });
 
     test("switching track clears the highlighted range", async ({ page, request }) => {

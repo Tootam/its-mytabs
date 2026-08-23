@@ -10,6 +10,7 @@ services:
         # Fedora&Podman specific
         security_opt:
             - label=disable
+        userns_mode: "keep-id:uid=1993,gid=1993"
         environment:
             MYTABS_DISABLE_AUTH: "true"
             MYTABS_IMPORT_ROOTS: ${MYTABS_IMPORT_ROOTS:-/srv/tabs/import}
