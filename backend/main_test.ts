@@ -21,6 +21,8 @@ await Deno.writeTextFile(indexPath, "<html><head></head><body>test</body></html>
 // Now import functions after env setup
 const { createTab, addAudio, getConfigJSON, updateConfigJSON } = await import("./tab.ts");
 const { main, closeServer } = await import("./main.ts");
+const { getLibraryTab, upsertArtist, upsertLibraryTab, upsertSong, upsertTabFile } = await import("./library.ts");
+const { storeLibraryFile } = await import("./storage.ts");
 
 // Start the server
 await main();
@@ -28,6 +30,50 @@ await main();
 await new Promise((res) => setTimeout(res, 5000));
 
 const baseURL = `http://127.0.0.1:47778`;
+
+/**
+ * Ensure a user exists and sign in, returning the session cookie header pair
+ * (e.g. `{ Cookie: "..." }`) for use in authed requests. Sign-up is disabled
+ * after the first user is created, so sign in first and only register when the
+ * user does not exist yet.
+ */
+async function registerAndSignIn(email: string): Promise<Record<string, string>> {
+    const credentials = {
+        email,
+        password: "password123",
+    };
+
+    let signInRes = await fetch(`${baseURL}/api/auth/sign-in/email`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(credentials),
+    });
+
+    if (signInRes.status !== 200) {
+        const signupRes = await fetch(`${baseURL}/api/auth/sign-up/email`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                email,
+                name: email.split("@")[0],
+                password: "password123",
+            }),
+        });
+        assertEquals(signupRes.ok, true, "signup failed: " + await signupRes.text());
+
+        signInRes = await fetch(`${baseURL}/api/auth/sign-in/email`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(credentials),
+        });
+    }
+    assertEquals(signInRes.status, 200, "sign-in failed");
+
+    const setCookie = signInRes.headers.get("set-cookie");
+    assertExists(setCookie, "No set-cookie header from sign-in");
+    const cookiePair = setCookie!.split(";", 1)[0];
+    return { Cookie: cookiePair };
+}
 
 Deno.test({
     name: "private tab endpoints require authentication (HTTP)",
@@ -69,6 +115,12 @@ Deno.test({
         const res3 = await fetch(`${baseURL}/api/tab/${encodeURIComponent(id)}/file`, { method: "GET" });
         const j3 = await res3.json();
         assertEquals(res3.status, 400);
+
+        // 4) Library browse should require auth even when public tabs exist
+        const res4 = await fetch(`${baseURL}/api/library?mode=album&limit=10`, { method: "GET" });
+        const j4 = await res4.json();
+        assertEquals(res4.status, 400);
+        assertEquals(j4.ok, false);
     },
 });
 
@@ -121,37 +173,111 @@ Deno.test({
 });
 
 Deno.test({
+    name: "library-backed tab info does not require a legacy tab folder (HTTP)",
+    sanitizeOps: false,
+    sanitizeResources: false,
+    fn: async () => {
+        const stored = await storeLibraryFile(new Uint8Array([210, 211, 212]), "gp");
+        const tabFile = upsertTabFile(stored);
+        const artist = upsertArtist("Imported Artist");
+        const song = upsertSong(artist.id, "Imported Song");
+        const tab = upsertLibraryTab({
+            id: "imported-without-folder",
+            songId: song.id,
+            tabFileId: tabFile.id,
+            title: "Imported Song",
+            artist: "Imported Artist",
+            filename: "tab.gp",
+            originalFilename: "imported.gp",
+            public: true,
+        });
+
+        const res = await fetch(`${baseURL}/api/tab/${encodeURIComponent(tab.id)}`, { method: "GET" });
+        const json = await res.json();
+
+        assertEquals(res.status, 200, JSON.stringify(json));
+        assertEquals(json.ok, true);
+        assertEquals(json.tab.id, tab.id);
+    },
+});
+
+Deno.test({
+    name: "opening a tab records last access and it appears in the tab list (HTTP)",
+    sanitizeOps: false,
+    sanitizeResources: false,
+    fn: async () => {
+        // The /api/tabs list requires login
+        const authed = await registerAndSignIn("test+ci@example.com");
+
+        // Create a tab, make it public so it can also be opened without auth
+        const tabData = new Uint8Array([230, 231, 232]);
+        const id = await createTab(tabData, "gp", "Recent Test", "Recent Artist", "recent.gp");
+        await updateConfigJSON(id, async (config) => {
+            config.tab.public = true;
+        });
+
+        // No last access yet (kv.list leaves missing keys undefined)
+        let tabs = await (await fetch(`${baseURL}/api/tabs`, { headers: authed })).json();
+        let tab = tabs.tabs.find((t: { id: string }) => t.id === id);
+        assertExists(tab);
+        assertEquals(tab.lastAccessAt, undefined);
+
+        // Open the tab
+        const res1 = await fetch(`${baseURL}/api/tab/${encodeURIComponent(id)}`, { method: "GET" });
+        assertEquals(res1.status, 200);
+
+        // lastAccessAt is now present on the tab in the list
+        tabs = await (await fetch(`${baseURL}/api/tabs`, { headers: authed })).json();
+        tab = tabs.tabs.find((t: { id: string }) => t.id === id);
+        assertExists(tab);
+        assertExists(tab.lastAccessAt);
+        assertEquals(typeof tab.lastAccessAt, "string");
+        assertEquals(Number.isNaN(new Date(tab.lastAccessAt).getTime()), false, "lastAccessAt is a valid date");
+    },
+});
+
+Deno.test({
+    name: "tab list with more than 10 tabs still returns last access times (HTTP)",
+    sanitizeOps: false,
+    sanitizeResources: false,
+    fn: async () => {
+        // The /api/tabs list requires login
+        const authed = await registerAndSignIn("test+ci@example.com");
+
+        // Create 12 tabs (one more than the kv.getMany 10-key limit)
+        const ids: string[] = [];
+        for (let i = 0; i < 12; i++) {
+            const tabData = new Uint8Array([200 + i, 100, 50]);
+            const id = await createTab(tabData, "gp", `Bulk ${i}`, "Bulk Artist", `bulk-${i}.gp`);
+            ids.push(id);
+            await updateConfigJSON(id, async (config) => {
+                config.tab.public = true;
+            });
+        }
+
+        // Open a handful of them so they get last access times
+        for (const id of ids.slice(0, 5)) {
+            const res = await fetch(`${baseURL}/api/tab/${encodeURIComponent(id)}`, { method: "GET" });
+            assertEquals(res.status, 200);
+        }
+
+        // The list endpoint must not 400 even with >10 tabs; the opened tabs
+        // carry a lastAccessAt.
+        const tabs = await (await fetch(`${baseURL}/api/tabs`, { headers: authed })).json();
+        assertEquals(Array.isArray(tabs.tabs), true);
+        assertEquals(tabs.tabs.length >= 12, true, `expected >= 12 tabs, got ${tabs.tabs.length}`);
+
+        const opened = tabs.tabs.filter((t: { lastAccessAt: unknown }) => t.lastAccessAt);
+        assertEquals(opened.length >= 5, true, `expected >= 5 tabs with lastAccessAt, got ${opened.length}`);
+    },
+});
+
+Deno.test({
     name: "logged-in user can access private resources (HTTP)",
     sanitizeOps: false,
     sanitizeResources: false,
     fn: async () => {
-        // Register a new user
-        const signupRes = await fetch(`${baseURL}/api/auth/sign-up/email`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ email: "test+ci@example.com", name: "CI Test", password: "password123" }),
-        });
-        const signupJson = await signupRes.json();
-        // sign up should succeed
-        assertEquals(signupRes.ok, true, "signup failed: " + JSON.stringify(signupJson));
-
-        // Sign in via auth handler
-        const signInRes = await fetch(`${baseURL}/api/auth/sign-in/email`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ email: "test+ci@example.com", password: "password123" }),
-        });
-
-        console.log("Sign-in response status:", signInRes.status);
-        assertEquals(signInRes.status, 200, "sign-in failed");
-        const signInJson = await signInRes.json();
-        console.log("Sign-in response JSON:", signInJson);
-
-        // Extract Set-Cookie
-        const setCookie = signInRes.headers.get("set-cookie");
-        assertExists(setCookie, "No set-cookie header from sign-in");
-        // Use only the cookie pair before the first semicolon
-        const cookiePair = setCookie!.split(";", 1)[0];
+        const authed = await registerAndSignIn("test+ci@example.com");
 
         // Create a private tab
         const tabData = new Uint8Array([240, 241, 242]);
@@ -164,7 +290,7 @@ Deno.test({
         // Access protected /api/tab/:id with cookie
         const resTab = await fetch(`${baseURL}/api/tab/${encodeURIComponent(id)}`, {
             method: "GET",
-            headers: { Cookie: cookiePair },
+            headers: authed,
         });
         assertEquals(resTab.status, 200);
         const tabJson = await resTab.json();
@@ -177,7 +303,7 @@ Deno.test({
 
         const resAudio = await fetch(`${baseURL}/api/tab/${encodeURIComponent(id)}/audio/${encodeURIComponent("auth.mp3")}`, {
             method: "GET",
-            headers: { Cookie: cookiePair },
+            headers: authed,
         });
         assertEquals(resAudio.status, 200);
         await resAudio.body?.cancel();
@@ -185,10 +311,81 @@ Deno.test({
         // Fetch the tab file with cookie
         const resFile = await fetch(`${baseURL}/api/tab/${encodeURIComponent(id)}/file`, {
             method: "GET",
-            headers: { Cookie: cookiePair },
+            headers: authed,
         });
         assertEquals(resFile.status, 200);
         await resFile.body?.cancel();
+
+        const stored = await storeLibraryFile(new Uint8Array([1, 4, 7]), "gp");
+        const tabFile = upsertTabFile(stored);
+        const importedArtist = upsertArtist("HTTP Imported Artist");
+        const importedSong = upsertSong(importedArtist.id, "HTTP Imported Song");
+        const importedTab = upsertLibraryTab({
+            id: "http-imported-edit",
+            songId: importedSong.id,
+            tabFileId: tabFile.id,
+            title: "HTTP Imported Song",
+            artist: "HTTP Imported Artist",
+            filename: "tab.gp",
+            originalFilename: "http-imported.gp",
+            public: false,
+        });
+
+        const editRes = await fetch(`${baseURL}/api/tab/${encodeURIComponent(importedTab.id)}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...authed },
+            body: JSON.stringify({ title: "HTTP Renamed Song", artist: "HTTP Renamed Artist", public: true }),
+        });
+        const editJson = await editRes.json();
+        assertEquals(editRes.status, 200, JSON.stringify(editJson));
+        assertEquals(editJson.ok, true);
+
+        const updatedTab = getLibraryTab(importedTab.id);
+        assertExists(updatedTab);
+        assertEquals(updatedTab.title, "HTTP Renamed Song");
+        assertEquals(updatedTab.artist, "HTTP Renamed Artist");
+        assertEquals(updatedTab.public, true);
+
+        const libraryRes = await fetch(`${baseURL}/api/library?mode=album&limit=1&offset=0&search=${encodeURIComponent("HTTP Renamed")}`, {
+            method: "GET",
+            headers: authed,
+        });
+        const libraryJson = await libraryRes.json();
+        assertEquals(libraryRes.status, 200, JSON.stringify(libraryJson));
+        assertEquals(libraryJson.ok, true);
+        assertEquals(libraryJson.library.totalVersionCount, 1);
+
+        const pageArtist = upsertArtist("HTTP Page Artist");
+        const pageSongOne = upsertSong(pageArtist.id, "HTTP Page Song 1");
+        const pageSongTwo = upsertSong(pageArtist.id, "HTTP Page Song 2");
+        const pageSongThree = upsertSong(pageArtist.id, "HTTP Page Song 3");
+        upsertLibraryTab({ id: "http-page-1", songId: pageSongOne.id, title: "HTTP Page Song 1", artist: "HTTP Page Artist" });
+        upsertLibraryTab({ id: "http-page-2", songId: pageSongTwo.id, title: "HTTP Page Song 2", artist: "HTTP Page Artist" });
+        upsertLibraryTab({ id: "http-page-3", songId: pageSongThree.id, title: "HTTP Page Song 3", artist: "HTTP Page Artist" });
+
+        const firstPageRes = await fetch(`${baseURL}/api/library?mode=album&limit=2&offset=0&search=${encodeURIComponent("HTTP Page Artist")}`, {
+            method: "GET",
+            headers: authed,
+        });
+        const firstPageJson = await firstPageRes.json();
+        assertEquals(firstPageRes.status, 200, JSON.stringify(firstPageJson));
+        assertEquals(firstPageJson.library.versionCount, 2);
+        assertEquals(firstPageJson.library.totalVersionCount, 3);
+        assertEquals(firstPageJson.library.offset, 0);
+        assertEquals(firstPageJson.library.limit, 2);
+        assertEquals(firstPageJson.library.hasMore, true);
+
+        const secondPageRes = await fetch(`${baseURL}/api/library?mode=album&limit=2&offset=2&search=${encodeURIComponent("HTTP Page Artist")}`, {
+            method: "GET",
+            headers: authed,
+        });
+        const secondPageJson = await secondPageRes.json();
+        assertEquals(secondPageRes.status, 200, JSON.stringify(secondPageJson));
+        assertEquals(secondPageJson.library.versionCount, 1);
+        assertEquals(secondPageJson.library.totalVersionCount, 3);
+        assertEquals(secondPageJson.library.offset, 2);
+        assertEquals(secondPageJson.library.limit, 2);
+        assertEquals(secondPageJson.library.hasMore, false);
     },
 });
 

@@ -27,6 +27,7 @@ const {
     replaceTab,
     updateTab,
     updateTabFav,
+    recordTabAccess,
     addAudio,
     removeAudio,
     updateAudio,
@@ -35,6 +36,7 @@ const {
     removeYoutube,
 } = await import("./tab.ts");
 const { db, kv } = await import("./db.ts");
+const { getLibraryConfigJSON, getLibraryTabInfo, getLibraryTabStoredPath } = await import("./library.ts");
 
 Deno.test("tabExists - non-existent tab", async () => {
     console.log("Running test: tabExists - non-existent tab");
@@ -52,6 +54,13 @@ Deno.test("createTab and getTab", async () => {
     assertEquals(tab.artist, "Test Artist");
     assertEquals(tab.filename, "tab.gp");
     assertEquals(tab.originalFilename, "test.gp");
+
+    const libraryTab = getLibraryTabInfo(id);
+    assertExists(libraryTab);
+    assertEquals(libraryTab.title, "Test Title");
+    assertEquals(libraryTab.artist, "Test Artist");
+    assertEquals(libraryTab.originalFilename, "test.gp");
+    assertExists(getLibraryTabStoredPath(id));
 });
 
 Deno.test("getTab - path traversal protection", async () => {
@@ -111,6 +120,7 @@ Deno.test("updateConfigJSON - queuing", async () => {
     // Check that updates were applied sequentially
     const tab = await getTab(id);
     assertEquals(tab.title, "Queue Test0123456789");
+    assertEquals(getLibraryTabInfo(id)?.title, "Queue Test0123456789");
 });
 
 Deno.test("deleteTab", async () => {
@@ -127,6 +137,7 @@ Deno.test("deleteTab", async () => {
     // Verify it no longer exists
     exists = await tabExists(id.toString());
     assertEquals(exists, false);
+    assertEquals(getLibraryTabInfo(id.toString()), null);
 });
 
 Deno.test("getConfigJSONPath", () => {
@@ -230,6 +241,8 @@ Deno.test("replaceTab", async () => {
     tab = await getTab(id);
     assertEquals(tab.filename, "tab.gpx");
     assertEquals(tab.originalFilename, "another.gpx");
+    assertEquals(getLibraryTabInfo(id)?.filename, "tab.gpx");
+    assertEquals(getLibraryTabInfo(id)?.originalFilename, "another.gpx");
 });
 
 Deno.test("updateTab", async () => {
@@ -245,6 +258,7 @@ Deno.test("updateTab", async () => {
     await updateTab(tab, {
         title: "Updated Title",
         artist: "Updated Artist",
+        album: "Updated Album",
         public: true,
     });
 
@@ -252,7 +266,12 @@ Deno.test("updateTab", async () => {
     tab = await getTab(id);
     assertEquals(tab.title, "Updated Title");
     assertEquals(tab.artist, "Updated Artist");
+    assertEquals(tab.album, "Updated Album");
     assertEquals(tab.public, true);
+    assertEquals(getLibraryTabInfo(id)?.title, "Updated Title");
+    assertEquals(getLibraryTabInfo(id)?.artist, "Updated Artist");
+    assertEquals(getLibraryTabInfo(id)?.album, "Updated Album");
+    assertEquals(getLibraryTabInfo(id)?.public, true);
 });
 
 Deno.test("updateTabFav", async () => {
@@ -275,6 +294,27 @@ Deno.test("updateTabFav", async () => {
     // Check updated
     tab = await getTab(id);
     assertEquals(tab.fav, false);
+    assertEquals(getLibraryTabInfo(id)?.fav, false);
+});
+
+Deno.test("recordTabAccess", async () => {
+    const tabData = new Uint8Array([28, 29, 31]);
+    const id = await createTab(tabData, "gp", "Access Test", "Access Artist", "access.gp");
+
+    // No access recorded yet
+    let tab = await getTab(id);
+    assertEquals(tab.lastAccessAt, undefined);
+
+    // Record access, it persists in config.json
+    const timestamp = "2026-08-13T12:00:00.000Z";
+    await recordTabAccess(id, timestamp);
+
+    tab = await getTab(id);
+    assertEquals(tab.lastAccessAt, timestamp);
+
+    // And it survives a fresh read from disk
+    const config = await getConfigJSON(id);
+    assertEquals(config?.tab.lastAccessAt, timestamp);
 });
 
 Deno.test("addAudio", async () => {
@@ -379,6 +419,7 @@ Deno.test("updateAudio", async () => {
     assertEquals(config!.audio[0].filename, "test.mp3");
     assertEquals(config!.audio[0].syncMethod, "advanced");
     assertEquals(config!.audio[0].advancedSync, "adv-sync");
+    assertEquals(getLibraryConfigJSON(id)?.audio.length, 1);
 
     // Update again to change to simple sync
     await updateAudio(tab, "test.mp3", {
@@ -396,7 +437,11 @@ Deno.test("updateAudio", async () => {
     // Try to update non-existent file, should throw
     await assertRejects(
         async () => {
-            await updateAudio(tab, "nonexistent.mp3", { syncMethod: "simple", simpleSync: 0, advancedSync: "" });
+            await updateAudio(tab, "nonexistent.mp3", {
+                syncMethod: "simple",
+                simpleSync: 0,
+                advancedSync: "",
+            });
         },
         Error,
         "Audio file not found",
@@ -405,7 +450,11 @@ Deno.test("updateAudio", async () => {
     // Test path traversal protection
     await assertRejects(
         async () => {
-            await updateAudio(tab, "../invalid.mp3", { syncMethod: "simple", simpleSync: 0, advancedSync: "" });
+            await updateAudio(tab, "../invalid.mp3", {
+                syncMethod: "simple",
+                simpleSync: 0,
+                advancedSync: "",
+            });
         },
         Error,
         "Invalid filename",

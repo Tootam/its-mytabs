@@ -1,5 +1,7 @@
 /// <reference types="vite/client" />
 
+import type { AlphaTabApi } from "@coderline/alphatab";
+
 /**
  * Global window properties injected by the backend
  */
@@ -16,5 +18,12 @@ declare global {
          * Set by the backend based on the MYTABS_DISABLE_AUTH environment variable.
          */
         authDisabled: boolean;
+        defaultImportRoot?: string;
+
+        /**
+         * The alphaTab API instance exposed for debugging on the tab page.
+         * Set in Tab.vue (initContainer).
+         */
+        api: AlphaTabApi;
     }
 }
