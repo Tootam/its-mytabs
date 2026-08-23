@@ -316,6 +316,35 @@ Deno.test({
         assertEquals(resFile.status, 200);
         await resFile.body?.cancel();
 
+        const createDraftRes = await fetch(`${baseURL}/api/tab/${encodeURIComponent(id)}/edit-session`, {
+            method: "POST",
+            headers: authed,
+        });
+        const createDraftJson = await createDraftRes.json();
+        assertEquals(createDraftRes.status, 200, JSON.stringify(createDraftJson));
+        const editToken = createDraftJson.editToken as string;
+        const draftData = new Uint8Array([10, 20, 30, 40]);
+
+        const updateDraftRes = await fetch(`${baseURL}/api/tab/${encodeURIComponent(id)}/edit-session/${encodeURIComponent(editToken)}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/octet-stream", ...authed },
+            body: draftData,
+        });
+        assertEquals(updateDraftRes.status, 200, await updateDraftRes.text());
+
+        const unchangedOriginalRes = await fetch(`${baseURL}/api/tab/${encodeURIComponent(id)}/file`, { headers: authed });
+        assertEquals(new Uint8Array(await unchangedOriginalRes.arrayBuffer()), tabData);
+        const savedDraftRes = await fetch(`${baseURL}/api/tab/${encodeURIComponent(id)}/file?editToken=${encodeURIComponent(editToken)}`, { headers: authed });
+        assertEquals(new Uint8Array(await savedDraftRes.arrayBuffer()), draftData);
+
+        const commitDraftRes = await fetch(`${baseURL}/api/tab/${encodeURIComponent(id)}/edit-session/${encodeURIComponent(editToken)}/save`, {
+            method: "POST",
+            headers: authed,
+        });
+        assertEquals(commitDraftRes.status, 200, await commitDraftRes.text());
+        const committedOriginalRes = await fetch(`${baseURL}/api/tab/${encodeURIComponent(id)}/file`, { headers: authed });
+        assertEquals(new Uint8Array(await committedOriginalRes.arrayBuffer()), draftData);
+
         const stored = await storeLibraryFile(new Uint8Array([1, 4, 7]), "gp");
         const tabFile = upsertTabFile(stored);
         const importedArtist = upsertArtist("HTTP Imported Artist");

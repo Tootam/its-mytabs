@@ -84,6 +84,19 @@ export async function findBackingTrackTabId(request: APIRequestContext): Promise
     throw new Error("Backing-track fixture tab not found");
 }
 
+export async function findNoteEditorTabId(request: APIRequestContext): Promise<string> {
+    for (let id = 2; id <= 20; id++) {
+        const res = await request.get(`/api/tab/${id}`);
+        if (res.ok()) {
+            const data = await res.json();
+            if (data.tab?.title === "Note Editor Test") {
+                return String(id);
+            }
+        }
+    }
+    throw new Error("Note-editor fixture tab not found");
+}
+
 export async function tickPosition(page: Page): Promise<number> {
     return page.evaluate(() => window.api?.tickPosition ?? 0);
 }

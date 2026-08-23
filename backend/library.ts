@@ -1,6 +1,7 @@
 import { db } from "./db.ts";
 import { buildLibraryBrowse, buildLibraryBrowseArtists, LibraryBrowseResult, LibraryBrowseRow, LibraryBrowseSong } from "./library-browse.ts";
 import { readBoolean, readNullableNumber, readNullableString, readNumber, readString, SqlRow } from "./sql-row.ts";
+import { storeLibraryFile } from "./storage.ts";
 import { ConfigJSON, ConfigJSONSchema, TabInfo, TabInfoSchema } from "./zod.ts";
 
 export interface LibraryArtist {
@@ -367,6 +368,31 @@ export function upsertLibraryTab(input: UpsertLibraryTabInput): LibraryTab {
 export function getLibraryTab(id: string): LibraryTab | null {
     const row = db.prepare("SELECT * FROM tabs WHERE id = ? AND deleted_at IS NULL").get(id) as SqlRow | undefined;
     return row ? mapTab(row) : null;
+}
+
+export async function replaceLibraryTabFile(id: string, data: Uint8Array, ext: string, originalFilename: string): Promise<LibraryTab> {
+    const existing = getLibraryTab(id);
+    if (!existing) {
+        throw new Error("Tab not found");
+    }
+
+    const stored = await storeLibraryFile(data, ext);
+    const tabFile = upsertTabFile(stored);
+    return upsertLibraryTab({
+        id: existing.id,
+        songId: existing.songId,
+        tabFileId: tabFile.id,
+        version: existing.version,
+        versionLabel: existing.versionLabel,
+        title: existing.title,
+        artist: existing.artist,
+        album: existing.album,
+        filename: `tab.${stored.ext}`,
+        originalFilename,
+        public: existing.public,
+        fav: existing.fav,
+        createdAt: existing.createdAt,
+    });
 }
 
 export function getCreatedImportTabSummaries(jobId: string): ImportCreatedTabSummary[] {
