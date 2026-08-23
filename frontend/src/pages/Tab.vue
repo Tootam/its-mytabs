@@ -19,6 +19,7 @@ import { FontAwesomeIcon } from "@fortawesome/vue-fontawesome";
 import { isLoggedIn } from "../auth-client.js";
 import { getKeySignature } from "../util.ts";
 import { countIn } from "../count-in.ts";
+import { metronome } from "../metronome.ts";
 import { setupSelection } from "../selection.ts";
 
 const alphaTab = await import("@coderline/alphatab");
@@ -294,11 +295,7 @@ export default defineComponent({
             if (!this.api) {
                 return;
             }
-            if (this.enableMetronome) {
-                this.api.metronomeVolume = 1;
-            } else {
-                this.api.metronomeVolume = 0;
-            }
+            this.applyMetronome();
             this.setConfig("enableMetronome", this.enableMetronome);
         },
 
@@ -344,6 +341,7 @@ export default defineComponent({
             // alphaTab's native count-in only works on the synthesizer player, so reset
             // its volume here to avoid a silent count-in running on external media.
             this.applyCountInVolume();
+            this.applyMetronome();
 
             // Save the playback range before switching audio source.
             const range = this.api.playbackRange;
@@ -678,6 +676,19 @@ export default defineComponent({
         },
 
         /**
+         * Keep alphaTab's timing events but disable its racy native Web Audio
+         * click. External audio sources intentionally keep the metronome off,
+         * matching the disabled toolbar control.
+         */
+        applyMetronome() {
+            if (!this.api) {
+                return;
+            }
+            this.api.metronomeVolume = 0;
+            metronome.setEnabled(this.enableMetronome && this.currentAudio === "synth");
+        },
+
+        /**
          * Get the tempo and time signature at the current playback position,
          * adjusted for the playback speed, to time the count-in beats.
          * @returns {{ bpm: number, beats: number }}
@@ -909,6 +920,11 @@ export default defineComponent({
                 // Exposing api to window for debugging
                 window.api = this.api;
 
+                // alphaTab reliably emits musical metronome events across loops,
+                // even when its native Web Audio click is muted.
+                this.api.midiEventsPlayedFilter = [alphaTab.midi.MidiEventType.AlphaTabMetronome];
+                this.api.midiEventsPlayed.on((args) => metronome.handleEvents(args.events));
+
                 // Custom selection handles + "click keeps the selection" behavior
                 this.selectionController = setupSelection(this.$refs.bassTabContainer, this.api);
 
@@ -1089,6 +1105,7 @@ export default defineComponent({
             this.playbackRangeRestoreTimer = undefined;
             countIn.cancel();
             this.isCountingIn = false;
+            metronome.setEnabled(false);
             this.seekDownBeat = null;
         },
 
