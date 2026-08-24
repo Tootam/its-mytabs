@@ -21,8 +21,10 @@ const {
     getLibraryConfigJSON,
     getLibrarySongVersionsForTab,
     getLibraryTabInfo,
+    getLibraryTabStoredPath,
     getTabFileByHash,
     normalizeLibraryText,
+    replaceLibraryTabFile,
     updateLibraryTabInfo,
     updateLibraryTabFav,
     updateLibraryTabVisibility,
@@ -37,6 +39,7 @@ const {
     upsertTabFileSource,
 } = await import("./library.ts");
 const { db, kv } = await import("./db.ts");
+const { resolveStoredPath } = await import("./storage.ts");
 
 Deno.test("library schema migration creates idempotent tables and indexes", () => {
     const tableNames = db.prepare(`
@@ -181,6 +184,38 @@ Deno.test("library tabs preserve exact ids, denormalized fields, versions, and v
 
     const favTabs = getAllLibraryTabInfos({ favOnly: true });
     assertEquals(favTabs.every((tab) => tab.fav), true);
+});
+
+Deno.test("library tab file replacement updates the active file without creating a new version", async () => {
+    const artist = upsertArtist("Replacement Artist");
+    const song = upsertSong(artist.id, "Replacement Song");
+    const originalData = new TextEncoder().encode("original tab");
+    const originalStored = await (await import("./storage.ts")).storeLibraryFile(originalData, "gp5");
+    const originalFile = upsertTabFile(originalStored);
+    const tab = upsertLibraryTab({
+        id: "replace-library-tab",
+        songId: song.id,
+        tabFileId: originalFile.id,
+        filename: "tab.gp5",
+        originalFilename: "original.gp5",
+        versionLabel: "Practice",
+        public: true,
+        fav: true,
+    });
+
+    const replacementData = new TextEncoder().encode("edited tab");
+    const replaced = await replaceLibraryTabFile(tab.id, replacementData, "gp", "tab.gp");
+
+    assertEquals(replaced.id, tab.id);
+    assertEquals(replaced.version, tab.version);
+    assertEquals(replaced.versionLabel, "Practice");
+    assertEquals(replaced.filename, "tab.gp");
+    assertEquals(replaced.originalFilename, "tab.gp");
+    assertEquals(replaced.public, true);
+    assertEquals(replaced.fav, true);
+    const replacedStoredPath = getLibraryTabStoredPath(replaced.id);
+    assertExists(replacedStoredPath);
+    assertEquals(await Deno.readTextFile(resolveStoredPath(replacedStoredPath)), "edited tab");
 });
 
 Deno.test("library tab info update moves songs and allocates the next target version", () => {

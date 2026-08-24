@@ -21,6 +21,7 @@ import { getKeySignature } from "../util.ts";
 import { countIn } from "../count-in.ts";
 import { metronome } from "../metronome.ts";
 import { setupSelection } from "../selection.ts";
+import { applyNoteEdits, getBeatAddress, getNoteAddress, getNoteAddressKey, parseFret } from "../note-editor.ts";
 
 const alphaTab = await import("@coderline/alphatab");
 const { ScrollMode, StaveProfile } = alphaTab;
@@ -39,6 +40,28 @@ export default defineComponent({
      * @type {alphaTab.AlphaTabApi}
      */
     api: null,
+
+    noteEditPopover: null,
+
+    noteEditInput: null,
+
+    noteEditTarget: null,
+
+    noteEditDoubleClickHandler: null,
+
+    noteEditOutsideClickHandler: null,
+
+    noteEditSessionToken: null,
+
+    noteEditSessionTabId: null,
+
+    noteEditSourceBytes: null,
+
+    noteDraftSavePromise: null,
+
+    fretEdits: new Map(),
+
+    addedNotes: [],
 
     audioHandler: null,
 
@@ -84,8 +107,17 @@ export default defineComponent({
             savedPlaybackRange: null,
             playbackRangeRestoreTimer: undefined,
             selectionController: null,
+            noteEditMode: false,
+            noteEditDirty: false,
+            noteEditSaving: false,
+            noteDraftSaving: false,
+            noteDraftSaveError: false,
 
             keyEvents: (e) => {
+                if (e.target instanceof Element && e.target.closest(".note-editor-actions, .note-editor-popover")) {
+                    return;
+                }
+
                 // Do not handle these tagName, because the only input is sync point, it is weird when play space to test the sync point
                 // It will type a space in the input instead of playing the music
                 // element.tagName === "INPUT" || element.tagName === "TEXTAREA" || element.isContentEditable
@@ -448,7 +480,31 @@ export default defineComponent({
 
         await this.initSocketIO();
 
+        this._onBeforeUnload = (event) => {
+            if (!this.noteEditDirty) {
+                return;
+            }
+            event.preventDefault();
+            event.returnValue = "";
+        };
+        window.addEventListener("beforeunload", this._onBeforeUnload);
+
         console.log("Mounted");
+    },
+    async beforeRouteLeave(to, from, next) {
+        if (this.noteEditDirty && !confirm("Discard your unsaved note changes?")) {
+            next(false);
+            return;
+        }
+
+        try {
+            await this.discardNoteEditSession();
+            this.resetNoteEditChanges();
+            next();
+        } catch (error) {
+            generalError(error);
+            next(false);
+        }
     },
     beforeUnmount() {
         console.log("Before unmount");
@@ -460,10 +516,18 @@ export default defineComponent({
             this._onDocumentClick = undefined;
         }
 
+        if (this._onBeforeUnload) {
+            window.removeEventListener("beforeunload", this._onBeforeUnload);
+            this._onBeforeUnload = undefined;
+        }
+
         this.socket.disconnect();
     },
     methods: {
         async load(trackID) {
+            if (this.noteDraftSavePromise) {
+                await this.noteDraftSavePromise;
+            }
             if (this.api) {
                 this.destroyContainer();
             }
@@ -490,6 +554,12 @@ export default defineComponent({
                 this.audioList = data.audioList;
             }
             await this.loadVersions();
+
+            if (this.isLoggedIn) {
+                await this.ensureNoteEditSession();
+            } else {
+                this.noteEditMode = false;
+            }
 
             const tempToken = await this.getTempToken();
 
@@ -819,7 +889,11 @@ export default defineComponent({
         },
 
         getFileURL(tempToken) {
-            return baseURL + `/api/tab/${this.tabID}/file?tempToken=${tempToken}`;
+            const params = new URLSearchParams({ tempToken });
+            if (this.noteEditSessionToken) {
+                params.set("editToken", this.noteEditSessionToken);
+            }
+            return baseURL + `/api/tab/${this.tabID}/file?${params}`;
         },
 
         async getTempToken() {
@@ -892,6 +966,7 @@ export default defineComponent({
                     },
                     core: {
                         file: this.getFileURL(tempToken),
+                        includeNoteBounds: true,
                         //tracks: [trackID],
                         fontDirectory: "/font/",
                         engine: "html5",
@@ -927,6 +1002,12 @@ export default defineComponent({
 
                 // Custom selection handles + "click keeps the selection" behavior
                 this.selectionController = setupSelection(this.$refs.bassTabContainer, this.api);
+
+                this.createNoteEditPopover();
+                this.noteEditDoubleClickHandler = (event) => this.handleNoteEditDoubleClick(event);
+                this.noteEditOutsideClickHandler = (event) => this.handleNoteEditOutsideClick(event);
+                this.$refs.bassTabContainer.addEventListener("dblclick", this.noteEditDoubleClickHandler, true);
+                this.$refs.bassTabContainer.addEventListener("mousedown", this.noteEditOutsideClickHandler, true);
 
                 // Used for showing/hiding the "Restart" button
                 this.api.playbackRangeChanged.on(() => {
@@ -1079,6 +1160,20 @@ export default defineComponent({
             this.api?.destroy();
             this.api = undefined;
 
+            this.noteEditPopover?.remove();
+            this.noteEditPopover = null;
+            this.noteEditInput = null;
+            this.noteEditTarget = null;
+
+            if (this.noteEditDoubleClickHandler) {
+                this.$refs.bassTabContainer?.removeEventListener("dblclick", this.noteEditDoubleClickHandler, true);
+                this.noteEditDoubleClickHandler = null;
+            }
+            if (this.noteEditOutsideClickHandler) {
+                this.$refs.bassTabContainer?.removeEventListener("mousedown", this.noteEditOutsideClickHandler, true);
+                this.noteEditOutsideClickHandler = null;
+            }
+
             // Remove custom selection handles + restore alphaTab's default method
             this.selectionController?.clear();
             this.selectionController = null;
@@ -1107,6 +1202,7 @@ export default defineComponent({
             this.isCountingIn = false;
             metronome.setEnabled(false);
             this.seekDownBeat = null;
+            this.noteEditTarget = null;
         },
 
         simpleSync(offset) {
@@ -1840,6 +1936,391 @@ export default defineComponent({
             this.$router.push(`/tab/${this.tabID}/edit/info`);
         },
 
+        getNoteEditSessionURL(suffix = "") {
+            return baseURL + `/api/tab/${this.noteEditSessionTabId ?? this.tabID}/edit-session/${this.noteEditSessionToken ?? ""}${suffix}`;
+        },
+
+        async ensureNoteEditSession() {
+            if (this.noteEditSessionToken && this.noteEditSessionTabId === this.tabID) {
+                this.noteEditMode = true;
+                if (!this.noteEditSourceBytes) {
+                    await this.loadNoteEditSourceBytes();
+                }
+                return;
+            }
+
+            if (this.noteEditSessionToken) {
+                await this.discardNoteEditSession();
+            }
+
+            const response = await fetch(baseURL + `/api/tab/${this.tabID}/edit-session`, {
+                method: "POST",
+                credentials: "include",
+            });
+            await checkFetch(response);
+            const data = await response.json();
+            this.noteEditSessionToken = data.editToken;
+            this.noteEditSessionTabId = this.tabID;
+            this.noteEditMode = true;
+            this.noteEditDirty = false;
+            this.noteDraftSaveError = false;
+            this.fretEdits = new Map();
+            this.addedNotes = [];
+            await this.loadNoteEditSourceBytes();
+        },
+
+        async loadNoteEditSourceBytes() {
+            const params = new URLSearchParams({ editToken: this.noteEditSessionToken });
+            const response = await fetch(baseURL + `/api/tab/${this.tabID}/file?${params}`, {
+                credentials: "include",
+            });
+            if (!response.ok) {
+                await checkFetch(response);
+            }
+            this.noteEditSourceBytes = new Uint8Array(await response.arrayBuffer());
+        },
+
+        async discardNoteEditSession() {
+            if (!this.noteEditSessionToken) {
+                return;
+            }
+            const response = await fetch(this.getNoteEditSessionURL(), {
+                method: "DELETE",
+                credentials: "include",
+            });
+            await checkFetch(response);
+            this.noteEditSessionToken = null;
+            this.noteEditSessionTabId = null;
+            this.noteEditSourceBytes = null;
+        },
+
+        resetNoteEditChanges() {
+            this.fretEdits = new Map();
+            this.addedNotes = [];
+            this.noteEditDirty = false;
+            this.noteDraftSaveError = false;
+            this.hideNoteEditPopover();
+        },
+
+        createNoteEditPopover() {
+            const form = document.createElement("form");
+            form.className = "note-editor-popover";
+            form.setAttribute("aria-label", "Fret editor");
+
+            const input = document.createElement("input");
+            input.className = "note-editor-fret-input";
+            input.type = "number";
+            input.min = "0";
+            input.max = "99";
+            input.step = "1";
+            input.inputMode = "numeric";
+            input.placeholder = " ";
+            input.setAttribute("aria-label", "Fret");
+            form.appendChild(input);
+
+            form.addEventListener("submit", (event) => {
+                event.preventDefault();
+                this.applyNoteEditTarget();
+            });
+            input.addEventListener("keydown", (event) => {
+                if (event.key === "Escape") {
+                    event.preventDefault();
+                    this.hideNoteEditPopover();
+                }
+            });
+            input.addEventListener("blur", () => {
+                if (!this.noteEditTarget) {
+                    return;
+                }
+                if (input.value.trim() === "") {
+                    this.hideNoteEditPopover();
+                    return;
+                }
+                this.applyNoteEditTarget();
+            });
+
+            this.$refs.bassTabContainer.appendChild(form);
+            this.noteEditPopover = form;
+            this.noteEditInput = input;
+        },
+
+        handleNoteEditDoubleClick(event) {
+            if (!this.noteEditMode || this.noteEditSaving || this.noteDraftSaving || event.button !== 0 || event.target.closest(".note-editor-popover")) {
+                return;
+            }
+
+            const canvas = this.api?.canvasElement?.element;
+            if (!canvas?.contains(event.target)) {
+                return;
+            }
+
+            event.preventDefault();
+            event.stopPropagation();
+            const rect = canvas.getBoundingClientRect();
+            const target = this.findTabStringTarget(event.clientX - rect.left, event.clientY - rect.top);
+            if (target) {
+                this.openNoteEditPopover(target);
+            }
+        },
+
+        handleNoteEditOutsideClick(event) {
+            if (!this.noteEditTarget || event.target.closest(".note-editor-popover")) {
+                return;
+            }
+            const canvas = this.api?.canvasElement?.element;
+            if (!canvas?.contains(event.target)) {
+                return;
+            }
+            if (this.noteEditInput.value.trim() === "") {
+                this.hideNoteEditPopover();
+            } else {
+                this.applyNoteEditTarget();
+            }
+        },
+
+        findTabStringTarget(x, y) {
+            const beat = this.api?.boundsLookup?.getBeatAtPos(x, y);
+            if (!beat) {
+                return null;
+            }
+
+            const stringCount = beat.voice.bar.staff.tuning.length;
+            if (stringCount === 0) {
+                return null;
+            }
+
+            const lineSpacing = 13 * this.api.settings.display.scale;
+            let bestTarget = null;
+            for (const beatBounds of this.api.boundsLookup.findBeats(beat) ?? []) {
+                const anchorBounds = beatBounds.notes?.find((bounds) => bounds.note.isStringed);
+                if (!anchorBounds) {
+                    continue;
+                }
+
+                const anchorLine = stringCount - anchorBounds.note.string;
+                const anchorY = anchorBounds.noteHeadBounds.y + anchorBounds.noteHeadBounds.h / 2;
+                const firstLineY = anchorY - anchorLine * lineSpacing;
+                const lineIndex = Math.round((y - firstLineY) / lineSpacing);
+                if (lineIndex < 0 || lineIndex >= stringCount) {
+                    continue;
+                }
+
+                const lineY = firstLineY + lineIndex * lineSpacing;
+                const distance = Math.abs(y - lineY);
+                if (distance > lineSpacing * 0.45 || bestTarget && bestTarget.distance <= distance) {
+                    continue;
+                }
+
+                const noteString = stringCount - lineIndex;
+                bestTarget = {
+                    beat,
+                    note: beat.getNoteOnString(noteString),
+                    string: noteString,
+                    displayString: lineIndex + 1,
+                    x: beatBounds.onNotesX,
+                    y: lineY,
+                    distance,
+                };
+            }
+            return bestTarget;
+        },
+
+        openNoteEditPopover(target) {
+            this.noteEditTarget = target;
+            this.noteEditInput.value = target.note ? String(target.note.fret) : "";
+            this.noteEditInput.title = `Bar ${target.beat.voice.bar.index + 1}, string ${target.displayString}`;
+            this.noteEditPopover.style.display = "flex";
+            this.noteEditPopover.style.left = `${target.x}px`;
+            this.noteEditPopover.style.top = `${target.y}px`;
+            requestAnimationFrame(() => {
+                this.noteEditInput.focus();
+                this.noteEditInput.select();
+            });
+        },
+
+        hideNoteEditPopover() {
+            this.noteEditTarget = null;
+            if (this.noteEditPopover) {
+                this.noteEditPopover.style.display = "none";
+            }
+        },
+
+        async applyNoteEditTarget() {
+            try {
+                if (!this.noteEditTarget) {
+                    return;
+                }
+
+                const target = this.noteEditTarget;
+                const fret = parseFret(this.noteEditInput.value);
+                let note = target.note;
+                if (!note) {
+                    if (target.beat.getNoteOnString(target.string)) {
+                        throw new Error(`String ${target.displayString} already has a note at this beat`);
+                    }
+
+                    note = new alphaTab.model.Note();
+                    note.string = target.string;
+                    note.fret = fret;
+                    target.beat.addNote(note);
+                    this.addedNotes.push({
+                        address: getBeatAddress(target.beat),
+                        string: target.string,
+                        fret,
+                        modelNote: note,
+                    });
+                } else {
+                    const addition = this.addedNotes.find((item) => item.modelNote === note || item.modelNote.id === note.id);
+                    if (addition) {
+                        addition.fret = fret;
+                    } else {
+                        const address = getNoteAddress(note);
+                        const key = getNoteAddressKey(address);
+                        const existing = this.fretEdits.get(key);
+                        const originalFret = existing?.originalFret ?? note.fret;
+                        if (fret === originalFret) {
+                            this.fretEdits.delete(key);
+                        } else {
+                            this.fretEdits.set(key, { address, fret, originalFret });
+                        }
+                    }
+                    note.fret = fret;
+                }
+
+                this.hideNoteEditPopover();
+                this.noteEditDirty = true;
+                this.refreshEditedScore();
+                const savePromise = this.persistNoteEditDraft();
+                this.noteDraftSavePromise = savePromise;
+                await savePromise;
+            } catch (error) {
+                generalError(error);
+                if (this.noteEditTarget) {
+                    this.noteEditInput?.focus();
+                    this.noteEditInput?.select();
+                }
+            } finally {
+                this.noteDraftSavePromise = null;
+            }
+        },
+
+        async persistNoteEditDraft() {
+            if (!this.noteEditSessionToken || !this.noteEditSourceBytes || this.fretEdits.size === 0 && this.addedNotes.length === 0) {
+                return;
+            }
+
+            this.noteDraftSaving = true;
+            this.noteDraftSaveError = false;
+            try {
+                const exportSettings = new alphaTab.Settings();
+                const score = alphaTab.importer.ScoreLoader.loadScoreFromBytes(this.noteEditSourceBytes, exportSettings);
+                applyNoteEdits(
+                    score,
+                    Array.from(this.fretEdits.values()).map(({ address, fret }) => ({ address, fret })),
+                    this.addedNotes.map(({ address, string, fret }) => ({ address, string, fret })),
+                    () => new alphaTab.model.Note(),
+                );
+                score.finish(exportSettings);
+                const exportedBytes = new alphaTab.exporter.Gp7Exporter().export(score, exportSettings);
+
+                const response = await fetch(this.getNoteEditSessionURL(), {
+                    method: "PUT",
+                    credentials: "include",
+                    headers: { "Content-Type": "application/octet-stream" },
+                    body: exportedBytes,
+                });
+                await checkFetch(response);
+
+                this.noteEditSourceBytes = exportedBytes;
+                this.fretEdits = new Map();
+                this.addedNotes = [];
+            } catch (error) {
+                this.noteDraftSaveError = true;
+                throw error;
+            } finally {
+                this.noteDraftSaving = false;
+            }
+        },
+
+        refreshEditedScore() {
+            if (!this.api) {
+                return;
+            }
+            this.pause();
+            this.api.clearPlaybackRangeHighlight();
+            this.api._selectionStart = undefined;
+            this.api._selectionEnd = undefined;
+            this.api.render();
+            this.api.loadMidiForScore();
+        },
+
+        async discardNoteEdits() {
+            if (this.noteEditSaving) {
+                return;
+            }
+            const trackID = this.selectedTrack;
+            this.noteEditSaving = true;
+            try {
+                if (this.noteDraftSavePromise) {
+                    await this.noteDraftSavePromise.catch(() => undefined);
+                }
+                await this.discardNoteEditSession();
+                this.resetNoteEditChanges();
+                await this.load(trackID);
+            } catch (error) {
+                generalError(error);
+            } finally {
+                this.noteEditSaving = false;
+            }
+        },
+
+        async saveNoteEdits() {
+            if (this.noteEditSaving || !this.noteEditSessionToken) {
+                return;
+            }
+
+            this.noteEditSaving = true;
+            try {
+                if (this.noteEditTarget) {
+                    if (this.noteEditInput.value.trim() === "") {
+                        this.hideNoteEditPopover();
+                    } else {
+                        await this.applyNoteEditTarget();
+                        if (this.noteEditTarget) {
+                            return;
+                        }
+                    }
+                }
+                if (this.noteDraftSavePromise) {
+                    await this.noteDraftSavePromise;
+                }
+                if (!this.noteEditDirty) {
+                    return;
+                }
+                if (this.noteDraftSaveError || this.fretEdits.size > 0 || this.addedNotes.length > 0) {
+                    await this.persistNoteEditDraft();
+                }
+
+                const saveResponse = await fetch(this.getNoteEditSessionURL("/save"), {
+                    method: "POST",
+                    credentials: "include",
+                });
+                await checkFetch(saveResponse);
+
+                const trackID = this.selectedTrack;
+                this.noteEditSessionToken = null;
+                this.noteEditSessionTabId = null;
+                this.noteEditSourceBytes = null;
+                this.resetNoteEditChanges();
+                await this.load(trackID);
+                notify({ text: "Tab notes saved", type: "success" });
+            } catch (error) {
+                generalError(error);
+            } finally {
+                this.noteEditSaving = false;
+            }
+        },
+
         hasBackingTrack() {
             return !!this.api.score.backingTrack;
         },
@@ -1982,12 +2463,12 @@ export default defineComponent({
         <div class="key-signature badge bg-secondary" v-if="keySignature && setting.showKeySignature">
             {{ keySignature }}
         </div>
-        <div ref="bassTabContainer" v-pre></div>
+        <div ref="bassTabContainer" class="tab-score" v-pre></div>
 
         <!-- Just add a margin, don't let youtube player overlay the tab -->
         <div :class='{ "yt-margin": currentAudio.startsWith(`youtube-`) }'></div>
 
-        <div class="toolbar" :class='{ "auto-hide": setting.toolbarAutoHide }'>
+        <div class="toolbar" :class='{ "auto-hide": setting.toolbarAutoHide && !noteEditMode }'>
             <div class="scroll">
                 <div class="track-selector selector" ref="trackSelector">
                     <div class="button" @click='showList("track")'>
@@ -2034,10 +2515,22 @@ export default defineComponent({
                     Speed: <input type="number" class="form-control" min="0" max="1000" step="1" v-model="speed" /> (%)
                 </div>
 
-                <div class="btn-edit" v-if="isLoggedIn">
-                    <button class="btn btn-secondary" @click="edit()">
-                        Edit
-                    </button>
+                <div class="toolbar-actions" v-if="isLoggedIn">
+                    <div class="note-editor-actions" v-if="noteEditMode">
+                        <span class="unsaved" v-if="noteDraftSaving">Saving working copy...</span>
+                        <span class="draft-error" v-else-if="noteDraftSaveError">Working copy save failed</span>
+                        <span class="draft-saved" v-else-if="noteEditDirty">Working copy saved</span>
+                        <button class="btn btn-success" type="button" :disabled="!noteEditDirty || noteEditSaving" @click="saveNoteEdits">
+                            {{ noteEditSaving ? "Saving..." : "Save" }}
+                        </button>
+                        <button class="btn btn-outline-light" type="button" :disabled="noteEditSaving" @click="discardNoteEdits">Discard</button>
+                    </div>
+
+                    <div class="btn-edit">
+                        <button class="btn btn-secondary" @click="edit()">
+                            Edit info
+                        </button>
+                    </div>
                 </div>
             </div>
 
@@ -2175,6 +2668,10 @@ $youtube-height: 200px;
     height: $youtube-height !important;
 }
 
+.tab-score {
+    position: relative;
+}
+
 .toolbar {
     backdrop-filter: blur(10px);
     border-bottom: 1px solid #3c3b40;
@@ -2205,9 +2702,30 @@ $youtube-height: 200px;
         flex-grow: 4;
         column-gap: 10px;
 
-        .btn-edit {
-            flex-grow: 1;
-            text-align: right;
+        .toolbar-actions {
+            align-items: center;
+            display: flex;
+            flex: 0 0 auto;
+            gap: 10px;
+            margin-left: auto;
+        }
+
+        .note-editor-actions {
+            align-items: center;
+            display: flex;
+            gap: 8px;
+
+            .unsaved {
+                color: #ffc107;
+            }
+
+            .draft-saved {
+                color: #7edb8a;
+            }
+
+            .draft-error {
+                color: #ff7b7b;
+            }
         }
 
         .button,

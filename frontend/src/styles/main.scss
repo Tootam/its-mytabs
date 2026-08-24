@@ -19,6 +19,43 @@
     background: rgba(64, 64, 255, 0.1);
 }
 
+.note-editor-popover {
+    display: none;
+    position: absolute;
+    transform: translate(-50%, -50%);
+    z-index: 1004;
+
+    input {
+        appearance: textfield;
+        background: #24282c;
+        border: 2px solid #ffc107;
+        border-radius: 3px;
+        box-shadow: 0 0 4px rgba(255, 193, 7, 0.8);
+        color: #fff;
+        font-size: 12px;
+        font-weight: 700;
+        height: 17px;
+        line-height: 13px;
+        padding: 0 2px;
+        text-align: center;
+        width: 26px;
+
+        &:focus {
+            background: #24282c;
+            border-color: #ffd54f;
+            box-shadow: 0 0 5px rgba(255, 213, 79, 0.9);
+            color: #fff;
+            outline: 0;
+        }
+
+        &::-webkit-inner-spin-button,
+        &::-webkit-outer-spin-button {
+            appearance: none;
+            margin: 0;
+        }
+    }
+}
+
 // Selection handles (drag to expand the highlighted practice range)
 .at-selection-handles {
     position: absolute;

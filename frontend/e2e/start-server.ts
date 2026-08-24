@@ -172,3 +172,15 @@ await updateConfigJSON(backingTabId, async (config) => {
     config.tab.public = true;
 });
 console.log("[e2e] Created backing-track fixture tab", backingTabId);
+
+const noteEditorTabId = await createTab(
+    await Deno.readFile("./extra/demo-tab.gp"),
+    "gp",
+    "Note Editor Test",
+    "e2e",
+    "note-editor-tab.gp",
+);
+await updateConfigJSON(noteEditorTabId, async (config) => {
+    config.tab.public = true;
+});
+console.log("[e2e] Created note-editor fixture tab", noteEditorTabId);

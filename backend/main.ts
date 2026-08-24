@@ -26,6 +26,7 @@ import {
     removeAudio,
     removeYoutube,
     replaceTab,
+    tabExists,
     updateAudio,
     updateConfigJSON,
     updateTab,
@@ -50,6 +51,7 @@ import {
     getLibraryTab,
     getLibraryTabInfo,
     getLibraryTabStoredPath,
+    replaceLibraryTabFile,
     setPreferredSongTab,
     updateLibraryTabFav,
     updateLibraryTabVisibility,
@@ -57,8 +59,38 @@ import {
 import { resolveStoredPath } from "./storage.ts";
 import { migrateLegacyTabsToLibrary } from "./legacy-migration.ts";
 import { getSeparateJob, isModelInstalled, isOrtInstalled, isSeparateBusy, startMute, startSeparate } from "./separate.ts";
+import { createTabEditSession, discardTabEditSession, getTabEditSessionPath, readTabEditSession, updateTabEditSession } from "./tab-edit.ts";
 
 let httpServer: ServerType;
+
+async function getActiveTabFile(id: string): Promise<{ filePath: string; originalFilename: string }> {
+    const storedPath = getLibraryTabStoredPath(id);
+    if (storedPath) {
+        const tab = getLibraryTab(id);
+        if (!tab) {
+            throw new Error("Tab not found");
+        }
+        return {
+            filePath: resolveStoredPath(storedPath),
+            originalFilename: tab.originalFilename,
+        };
+    }
+
+    const tab = await getTab(id);
+    return {
+        filePath: getTabFilePath(tab),
+        originalFilename: tab.originalFilename,
+    };
+}
+
+async function replaceActiveTabFile(id: string, fileData: Uint8Array, ext: string, originalFilename: string): Promise<void> {
+    if (await tabExists(id)) {
+        const legacyTab = await getTab(id);
+        await replaceTab(legacyTab, fileData, ext, originalFilename);
+    } else {
+        await replaceLibraryTabFile(id, fileData, ext, originalFilename);
+    }
+}
 
 export async function main() {
     console.log(`It's MyTabs v${appVersion}`);
@@ -468,8 +500,6 @@ export async function main() {
             await checkLogin(c);
             const id = c.req.param("id");
 
-            const tab = await getTab(id);
-
             const form = await c.req.formData();
             const file = form.get("file");
 
@@ -489,11 +519,63 @@ export async function main() {
             }
 
             const arrayBuffer = await file.arrayBuffer();
-            await replaceTab(tab, new Uint8Array(arrayBuffer), ext, fileName);
+            await replaceActiveTabFile(id, new Uint8Array(arrayBuffer), ext, fileName);
 
             return c.json({
                 ok: true,
             });
+        } catch (e) {
+            return generalError(c, e);
+        }
+    });
+
+    app.post("/api/tab/:id/edit-session", async (c) => {
+        try {
+            const session = await getCurrentSession(c);
+            const id = c.req.param("id");
+            const activeFile = await getActiveTabFile(id);
+            const editToken = await createTabEditSession(id, session.user.id, activeFile.filePath);
+            return c.json({
+                ok: true,
+                editToken,
+            });
+        } catch (e) {
+            return generalError(c, e);
+        }
+    });
+
+    app.put("/api/tab/:id/edit-session/:editToken", async (c) => {
+        try {
+            const session = await getCurrentSession(c);
+            const id = c.req.param("id");
+            const editToken = c.req.param("editToken");
+            const fileData = new Uint8Array(await c.req.raw.arrayBuffer());
+            await updateTabEditSession(id, editToken, session.user.id, fileData);
+            return c.json({ ok: true });
+        } catch (e) {
+            return generalError(c, e);
+        }
+    });
+
+    app.post("/api/tab/:id/edit-session/:editToken/save", async (c) => {
+        try {
+            const session = await getCurrentSession(c);
+            const id = c.req.param("id");
+            const editToken = c.req.param("editToken");
+            const fileData = await readTabEditSession(id, editToken, session.user.id);
+            await replaceActiveTabFile(id, fileData, "gp", "tab.gp");
+            await discardTabEditSession(id, editToken, session.user.id);
+            return c.json({ ok: true });
+        } catch (e) {
+            return generalError(c, e);
+        }
+    });
+
+    app.delete("/api/tab/:id/edit-session/:editToken", async (c) => {
+        try {
+            const session = await getCurrentSession(c);
+            await discardTabEditSession(c.req.param("id"), c.req.param("editToken"), session.user.id);
+            return c.json({ ok: true });
         } catch (e) {
             return generalError(c, e);
         }
@@ -838,6 +920,7 @@ export async function main() {
 
             // Unfortunately AlphaTab does not support cookie auth, we need a short lived temp token to auth via query param
             const tempToken = c.req.query("tempToken");
+            let authenticatedUserId: string | undefined;
 
             // Check kv for temp token
             if (tempToken) {
@@ -853,23 +936,19 @@ export async function main() {
                 // Delete the token after use
                 await kv.delete(["temp_token", tempToken]);
             } else {
-                await checkLogin(c);
+                authenticatedUserId = (await getCurrentSession(c)).user.id;
             }
 
-            let originalFilename = "tab.gp";
-            let filePath = "";
-            const storedPath = getLibraryTabStoredPath(id);
-            if (storedPath) {
-                const tab = getLibraryTab(id);
-                if (!tab) {
-                    throw new Error("Tab not found");
-                }
-                filePath = resolveStoredPath(storedPath);
-                originalFilename = tab.originalFilename;
+            const editToken = c.req.query("editToken");
+            let filePath: string;
+            let originalFilename: string;
+            if (editToken) {
+                filePath = getTabEditSessionPath(id, editToken, authenticatedUserId);
+                originalFilename = "tab.gp";
             } else {
-                const tab = await getTab(id);
-                filePath = getTabFilePath(tab);
-                originalFilename = tab.originalFilename;
+                const activeFile = await getActiveTabFile(id);
+                filePath = activeFile.filePath;
+                originalFilename = activeFile.originalFilename;
             }
 
             // Check if file exists
