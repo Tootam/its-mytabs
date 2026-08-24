@@ -114,7 +114,7 @@ export default defineComponent({
             noteDraftSaveError: false,
 
             keyEvents: (e) => {
-                if (e.target instanceof Element && e.target.closest(".note-editor, .note-editor-popover")) {
+                if (e.target instanceof Element && e.target.closest(".note-editor-actions, .note-editor-popover")) {
                     return;
                 }
 
@@ -2469,23 +2469,6 @@ export default defineComponent({
         <div :class='{ "yt-margin": currentAudio.startsWith(`youtube-`) }'></div>
 
         <div class="toolbar" :class='{ "auto-hide": setting.toolbarAutoHide && !noteEditMode }'>
-            <div class="note-editor" v-if="noteEditMode">
-                <div class="note-editor-status">
-                    <strong>Edit notes</strong>
-                    <span>Double-click a string at an existing beat, then enter a fret.</span>
-                </div>
-
-                <div class="note-editor-actions">
-                    <span class="unsaved" v-if="noteDraftSaving">Saving working copy...</span>
-                    <span class="draft-error" v-else-if="noteDraftSaveError">Working copy save failed</span>
-                    <span class="draft-saved" v-else-if="noteEditDirty">Working copy saved</span>
-                    <button class="btn btn-success" type="button" :disabled="!noteEditDirty || noteEditSaving" @click="saveNoteEdits">
-                        {{ noteEditSaving ? "Saving..." : "Save" }}
-                    </button>
-                    <button class="btn btn-outline-light" type="button" :disabled="noteEditSaving" @click="discardNoteEdits">Discard</button>
-                </div>
-            </div>
-
             <div class="scroll">
                 <div class="track-selector selector" ref="trackSelector">
                     <div class="button" @click='showList("track")'>
@@ -2532,10 +2515,22 @@ export default defineComponent({
                     Speed: <input type="number" class="form-control" min="0" max="1000" step="1" v-model="speed" /> (%)
                 </div>
 
-                <div class="btn-edit" v-if="isLoggedIn">
-                    <button class="btn btn-secondary" @click="edit()">
-                        Edit info
-                    </button>
+                <div class="toolbar-actions" v-if="isLoggedIn">
+                    <div class="note-editor-actions" v-if="noteEditMode">
+                        <span class="unsaved" v-if="noteDraftSaving">Saving working copy...</span>
+                        <span class="draft-error" v-else-if="noteDraftSaveError">Working copy save failed</span>
+                        <span class="draft-saved" v-else-if="noteEditDirty">Working copy saved</span>
+                        <button class="btn btn-success" type="button" :disabled="!noteEditDirty || noteEditSaving" @click="saveNoteEdits">
+                            {{ noteEditSaving ? "Saving..." : "Save" }}
+                        </button>
+                        <button class="btn btn-outline-light" type="button" :disabled="noteEditSaving" @click="discardNoteEdits">Discard</button>
+                    </div>
+
+                    <div class="btn-edit">
+                        <button class="btn btn-secondary" @click="edit()">
+                            Edit info
+                        </button>
+                    </div>
                 </div>
             </div>
 
@@ -2707,9 +2702,30 @@ $youtube-height: 200px;
         flex-grow: 4;
         column-gap: 10px;
 
-        .btn-edit {
-            flex-grow: 1;
-            text-align: right;
+        .toolbar-actions {
+            align-items: center;
+            display: flex;
+            flex: 0 0 auto;
+            gap: 10px;
+            margin-left: auto;
+        }
+
+        .note-editor-actions {
+            align-items: center;
+            display: flex;
+            gap: 8px;
+
+            .unsaved {
+                color: #ffc107;
+            }
+
+            .draft-saved {
+                color: #7edb8a;
+            }
+
+            .draft-error {
+                color: #ff7b7b;
+            }
         }
 
         .button,
@@ -2759,44 +2775,6 @@ $youtube-height: 200px;
                 border: 1px solid #555b60;
                 color: white;
             }
-        }
-    }
-}
-
-.note-editor {
-    align-items: center;
-    background: #24282c;
-    border-bottom: 1px solid #555b60;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 12px;
-    padding: 10px 15px;
-
-    .note-editor-status {
-        display: flex;
-        flex-direction: column;
-        min-width: 220px;
-    }
-
-    .note-editor-actions {
-        align-items: center;
-        display: flex;
-        gap: 8px;
-    }
-
-    .note-editor-actions {
-        margin-left: auto;
-
-        .unsaved {
-            color: #ffc107;
-        }
-
-        .draft-saved {
-            color: #7edb8a;
-        }
-
-        .draft-error {
-            color: #ff7b7b;
         }
     }
 }
@@ -2957,15 +2935,6 @@ $padding: 20px;
     }
 
     .toolbar {
-        .note-editor {
-            align-items: stretch;
-            flex-direction: column;
-
-            .note-editor-actions {
-                margin-left: 0;
-            }
-        }
-
         .scroll {
             overflow-x: scroll;
         }

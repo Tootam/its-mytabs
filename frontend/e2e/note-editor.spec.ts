@@ -76,7 +76,8 @@ test("autosaves a working copy and only replaces the original on explicit save",
     await login(page);
     const tabId = await findNoteEditorTabId(request);
     await openTab(page, "synth", tabId);
-    await expect(page.getByText("Double-click a string at an existing beat, then enter a fret.")).toBeVisible();
+    await expect(page.locator(".toolbar > .note-editor")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Discard" })).toBeVisible();
     const location = await findEditableNote(page);
     const changedFret = location.fret === 0 ? 1 : 0;
     const originalHash = await originalFileHash(page, tabId);
@@ -104,7 +105,7 @@ test("autosaves a working copy and only replaces the original on explicit save",
     const cleanDraftSession = page.waitForResponse((response) => response.request().method() === "POST" && response.url().endsWith(`/api/tab/${tabId}/edit-session`));
     await page.getByRole("button", { name: "Discard" }).click();
     await cleanDraftSession;
-    await expect(page.getByText("Double-click a string at an existing beat, then enter a fret.")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Discard" })).toBeVisible();
     await page.waitForFunction(() => window.api?.boundsLookup?.isFinished && window.api?.player?.isReadyForPlayback);
     expect((await readEditedBeat(page, location)).fret).toBe(location.fret);
 
@@ -129,7 +130,7 @@ test("autosaves a working copy and only replaces the original on explicit save",
 
     await page.getByRole("button", { name: "Save", exact: true }).click();
     await expect(page.locator(".notification-content")).toContainText("Tab notes saved");
-    await expect(page.getByText("Double-click a string at an existing beat, then enter a fret.")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Discard" })).toBeVisible();
     await page.waitForFunction(() => window.api?.boundsLookup?.isFinished && window.api?.player?.isReadyForPlayback);
 
     const persisted = await readEditedBeat(page, refreshedLocation);
